@@ -30,3 +30,4 @@
 - 数据处理方式见 [PRIVACY.md](PRIVACY.md)。
 - 请不要在公开 Issue 中提交真实位置、行程、通知正文、API Key 或日志；安全问题见 [SECURITY.md](SECURITY.md)。
 - 本项目仍是研发原型，不能用于人身安全、应急或其他要求百分之百可靠的场景。
+
