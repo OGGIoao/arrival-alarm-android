@@ -1,0 +1,21 @@
+# Local configuration and editor files
+.idea/
+.vscode/
+*.log
+local.properties
+.env
+.env.*
+!.env.example
+android-app/build/
+android-app/.signing/
+outputs/
+*.apk
+*.aab
+*.keystore
+*.jks
+*.p12
+*.pem
+
+# OS files
+.DS_Store
+Thumbs.db
