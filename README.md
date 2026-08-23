@@ -2,9 +2,18 @@
 
 这是一个极简的 Android 到站提醒 App：输入地点后开始监控，接近目的地时用声音、振动和高优先级通知提醒。它不显示地图、路线、路况、换乘或 ETA。
 
+## 下载
+
+可直接下载安装调试签名试用包（最低 Android 8.0）：
+
+- 下载 APK（v0.4.2）：https://github.com/yueqiu666/arrival-alarm-android/releases/download/v0.4.2/arrival-alarm-debug.apk
+- Release 页面：https://github.com/yueqiu666/arrival-alarm-android/releases/tag/v0.4.2
+
+> 试用包仅供日常通勤试用，并非正式发布签名；正式使用请按下方步骤自行构建。
+
 ## 构建与试用
 
-当前公开的是可复现构建的源码，不提交调试签名或本机生成的 APK。最低支持 Android 8.0；构建步骤见 [android-app/README.md](android-app/README.md)。
+仓库只提交可复现构建的源码，不将调试签名或本机生成的 APK 纳入版本控制。最低支持 Android 8.0；构建步骤见 [android-app/README.md](android-app/README.md)。
 
 首次打开后授予精确位置和通知权限。出行检测、使用情况访问、通知使用权、后台位置和精确闹钟均为可选权限，应用会在对应功能首次启用时分别说明用途。
 
