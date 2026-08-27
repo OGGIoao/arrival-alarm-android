@@ -53,7 +53,7 @@
 - [ ] 执行一次恢复演练：从 U 盘副本恢复保险库和上传密钥，并核对证书指纹一致。
 - [ ] 在 GitHub `play-release` Environment 中配置四个 `ARRIVAL_UPLOAD_*` Secrets，并设置审批和分支保护。
 - [x] 已完成独立 Diff Review，并将 P0-1 Release 工程隔离为聚焦 Git checkpoint；地点联想和动画优化仍留在工作区，未混入本次提交。
-- [ ] 将 P0-1 checkpoint 推送到 GitHub，并实际运行一次未签名 `Android checks`，确认远端 clean build、test、lint、R8 和 Bundletool 全部成功。
+- [x] P0-1 checkpoint 已推送到 GitHub；未签名 [`Android checks #3`](https://github.com/yueqiu666/arrival-alarm-android/actions/runs/33066043677) 在 commit `3ecd12f` 上成功，远端 clean build、test、lint、R8、资源压缩和 Bundletool 均通过。验证产物摘要为 `sha256:cdf1465e1c56c5b86c2085d760005dfdd91b06882b3162446aae41e67f407f3e`，不得作为 Play 上传包使用。
 - [ ] 将签名工作流推送到 GitHub 后实际运行一次，验证远端 clean build、test、lint、R8、签名和 Bundletool 全部成功。
 - [ ] 保存远端签名 CI 的产物摘要和证书指纹证据；不得使用此前的临时测试 AAB。
 
