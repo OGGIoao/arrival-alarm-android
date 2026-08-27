@@ -1,12 +1,15 @@
 # Local configuration and editor files
 .idea/
 .vscode/
+.tools/
+.gradle/
 *.log
 local.properties
 .env
 .env.*
 !.env.example
 android-app/build/
+android-app/.gradle/
 android-app/.signing/
 outputs/
 *.apk

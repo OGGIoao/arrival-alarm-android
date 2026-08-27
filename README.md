@@ -2,6 +2,18 @@
 
 这是一个极简的 Android 到站提醒 App：输入地点后开始监控，接近目的地时用声音、振动和高优先级通知提醒。它不显示地图、路线、路况、换乘或 ETA。
 
+## 项目文档
+
+- [产品目标与边界](docs/PRODUCT.md)
+- [当前架构与调用流](docs/ARCHITECTURE.md)
+- [工程工作流](docs/WORKFLOW.md)
+- [技术决策记录](docs/DECISIONS.md)
+- [当前发布就绪状态](docs/RELEASE_READINESS.md)
+- [工程复盘与经验](docs/RETROSPECTIVE.md)
+- [变更记录](CHANGELOG.md)
+
+主要实现位于 `android-app/`：源码在 `android-app/src/`，纯 Java 核心测试在 `android-app/test/`，构建系统入口是 `android-app/gradlew.bat`；`android-app/build-apk.ps1` 是兼容旧 Debug APK 文件名的快捷入口。
+
 ## 下载
 
 可直接下载安装调试签名试用包（最低 Android 8.0）：
@@ -39,4 +51,3 @@
 - 数据处理方式见 [PRIVACY.md](PRIVACY.md)。
 - 请不要在公开 Issue 中提交真实位置、行程、通知正文、API Key 或日志；安全问题见 [SECURITY.md](SECURITY.md)。
 - 本项目仍是研发原型，不能用于人身安全、应急或其他要求百分之百可靠的场景。
-

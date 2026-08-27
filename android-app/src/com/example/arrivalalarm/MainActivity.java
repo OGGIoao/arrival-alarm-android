@@ -126,8 +126,7 @@ public final class MainActivity extends Activity {
             @Override public void onReceive(Context context, Intent intent) { refreshUi(); }
         };
         IntentFilter filter = new IntentFilter(TrackingService.ACTION_STATUS);
-        if (Build.VERSION.SDK_INT >= 33) registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
-        else registerReceiver(statusReceiver, filter);
+        registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
         refreshUi();
     }
 

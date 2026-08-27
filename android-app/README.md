@@ -1,16 +1,31 @@
 # Android 原生版
 
-这是“别坐过站”的 Android 原生实现，最低 Android 8.0（API 26），不依赖 Gradle、AndroidX、Google Play Services 或第三方 SDK。
+这是“别坐过站”的 Android 原生实现，正式 Application ID 为 `com.navobell.arrivalalarm`，最低 Android 8.0（API 26）。项目使用固定版本的 Gradle/AGP，但不依赖 AndroidX、Google Play Services 或第三方运行时 SDK。
 
 ## 构建
 
-需要 Android Platform 36 和 Build Tools 36.0.0：
+需要 JDK 17 或更高版本、Android Platform 36 和 Build Tools 36.0.0。Debug 完整检查：
 
 ```powershell
 .\android-app\build-apk.ps1 -SdkRoot "C:\path\to\android-sdk"
 ```
 
-脚本会先运行纯 Java 核心测试，再编译、DEX、对齐并使用本机生成的稳定调试证书签名。证书保存在已忽略的 `android-app/.signing/`，便于后续覆盖安装；APK 输出到同样已忽略的 `outputs/arrival-alarm-debug.apk`。不要公开调试证书，正式发布时请使用单独的发行签名。
+脚本会调用项目自带的 Gradle Wrapper，运行核心测试和 Debug Lint，再生成 Debug APK 并复制到已忽略的 `outputs/arrival-alarm-debug.apk`。
+
+Release 工程检查：
+
+```powershell
+.\android-app\build-release.ps1 -SdkRoot "C:\path\to\android-sdk"
+```
+
+Release 默认启用 R8 和资源压缩；脚本会自动规避中文 Windows 用户目录导致的 Gradle 测试进程问题。未设置上传密钥时，AAB 仅用于工程验证，不能上传 Google Play。正式签名从以下环境变量读取：
+
+- `ARRIVAL_UPLOAD_KEYSTORE`
+- `ARRIVAL_UPLOAD_STORE_PASSWORD`
+- `ARRIVAL_UPLOAD_KEY_ALIAS`
+- `ARRIVAL_UPLOAD_KEY_PASSWORD`
+
+四项必须全部设置，且密钥文件和密码不得提交到 Git。设置后运行 `.\android-app\build-release.ps1 -SdkRoot "C:\path\to\android-sdk" -VerifyPlayBundle`，同时检查 AAB 格式和签名。
 
 ## 已实现
 
