@@ -114,6 +114,22 @@ public final class AppPrefs {
     }
 
     public boolean isJourneyEnabled() { return prefs.getBoolean(JOURNEY_ENABLED, false); }
+    public void disableDeferredAutomation() {
+        prefs.edit()
+                .putBoolean(JOURNEY_ENABLED, false)
+                .putBoolean(JOURNEY_SEEN, true)
+                .putBoolean(APP_WATCH_ENABLED, false)
+                .putBoolean(TRANSIT_WATCH_ENABLED, false)
+                .putBoolean(STATION_WATCH_ENABLED, false)
+                .putString(JOURNEY_STATE, CoreLogic.JourneyDetector.DISABLED)
+                .remove(ANCHOR_LAT)
+                .remove(ANCHOR_LNG)
+                .remove(CONFIRM_LAT)
+                .remove(CONFIRM_LNG)
+                .remove(CONFIRM_TIME)
+                .remove(STILL_SINCE)
+                .apply();
+    }
     public void setJourneyEnabled(boolean enabled) {
         SharedPreferences.Editor editor = prefs.edit().putBoolean(JOURNEY_ENABLED, enabled);
         if (!enabled) editor.putString(JOURNEY_STATE, CoreLogic.JourneyDetector.DISABLED).remove(ANCHOR_LAT).remove(ANCHOR_LNG);
@@ -201,6 +217,10 @@ public final class AppPrefs {
     }
 
     public static final class ReminderTask {
+        public static final String STATUS_ACTIVE = "active";
+        public static final String STATUS_ALERTING = "alerting";
+        public static final String STATUS_INTERRUPTED = "interrupted";
+
         public final String id;
         public final Destination destination;
         public final int radiusMeters;
@@ -216,6 +236,16 @@ public final class AppPrefs {
             this.status = status;
             this.startedAt = startedAt;
             this.lastDistanceMeters = Double.NaN;
+        }
+
+        public boolean isActive() { return STATUS_ACTIVE.equals(status); }
+        public boolean isAlerting() { return STATUS_ALERTING.equals(status); }
+        public boolean isInterrupted() { return STATUS_INTERRUPTED.equals(status); }
+        public void markInterrupted() {
+            if (isActive()) status = STATUS_INTERRUPTED;
+        }
+        public void resume() {
+            status = STATUS_ACTIVE;
         }
 
         JSONObject toJson() {

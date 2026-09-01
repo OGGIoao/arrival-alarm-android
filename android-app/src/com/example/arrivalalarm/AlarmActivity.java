@@ -1,7 +1,6 @@
 package com.example.arrivalalarm;
 
 import android.app.Activity;
-import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -69,8 +68,7 @@ public final class AlarmActivity extends Activity {
         arrived.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View view) {
                 view.performHapticFeedback(HapticFeedbackConstants.CONFIRM);
-                Intent service = new Intent(AlarmActivity.this, TrackingService.class).setAction(TrackingService.ACTION_STOP_REMINDER);
-                startService(service);
+                ReminderRuntimeCoordinator.stopReminder(AlarmActivity.this);
                 finish();
             }
         });

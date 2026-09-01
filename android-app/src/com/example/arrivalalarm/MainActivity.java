@@ -1,5 +1,6 @@
 package com.example.arrivalalarm;
 
+import android.annotation.SuppressLint;
 import android.Manifest;
 import android.animation.ValueAnimator;
 import android.app.Activity;
@@ -23,7 +24,10 @@ import android.location.LocationManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.Process;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.text.Editable;
 import android.text.TextWatcher;
@@ -63,6 +67,7 @@ import java.util.concurrent.ScheduledThreadPoolExecutor;
 
 public final class MainActivity extends Activity {
     private static final int REQUEST_CORE_PERMISSIONS = 1001;
+    private static final String PRIVACY_POLICY_URL = "https://github.com/yueqiu666/arrival-alarm-android/blob/main/PRIVACY.md";
     private int GREEN;
     private int INK;
     private int MUTED;
@@ -76,18 +81,33 @@ public final class MainActivity extends Activity {
     private AppPrefs prefs;
     private EditText destinationInput;
     private LinearLayout activeCard;
+    private TextView activeLabel;
     private TextView activeName;
     private TextView activeMeta;
+    private Button activeAction;
     private LinearLayout recentsList;
     private LinearLayout suggestionsList;
     private TextView journeyStatus;
     private TextView fixedAlarmStatus;
     private AppPrefs.Destination pendingDestination;
     private boolean pendingJourneyEnable;
+    private boolean pendingResume;
     private BroadcastReceiver statusReceiver;
+    private ReminderRuntime.Snapshot runtimeSnapshot = ReminderRuntime.Snapshot.stopped();
+    private ReminderStateLogic.State renderedReminderState;
+    private final Handler runtimeHandler = new Handler(Looper.getMainLooper());
+    private final Runnable runtimeRefresh = new Runnable() {
+        @Override public void run() {
+            refreshUi();
+            runtimeHandler.postDelayed(this, 10_000L);
+        }
+    };
     private int suggestionGeneration;
     private Runnable suggestionDebounce;
     private Future<?> suggestionFuture;
+    private final InteractionGate suggestionRenderGate = new InteractionGate();
+    private final InteractionGate recentsRenderGate = new InteractionGate();
+    private List<AppPrefs.Destination> localSuggestionCandidates = Collections.emptyList();
     private final ScheduledThreadPoolExecutor placeSearchExecutor = new ScheduledThreadPoolExecutor(2);
     private final Map<String, List<AppPrefs.Destination>> suggestionCache = new LinkedHashMap<String, List<AppPrefs.Destination>>(32, 0.75f, true) {
         @Override protected boolean removeEldestEntry(Map.Entry<String, List<AppPrefs.Destination>> eldest) { return size() > 32; }
@@ -97,6 +117,8 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = new AppPrefs(this);
+        disableDeferredAutomation();
+        ReminderRuntimeCoordinator.ensureRestoreNotificationChannel(this);
         placeSearchExecutor.setRemoveOnCancelPolicy(true);
         configurePalette();
         getWindow().setStatusBarColor(PAPER);
@@ -109,7 +131,13 @@ public final class MainActivity extends Activity {
         }
         buildUi();
         handleIntent(getIntent());
-        if (!prefs.hasSeenJourneyPrompt()) showJourneyOptIn();
+    }
+
+    private void disableDeferredAutomation() {
+        prefs.disableDeferredAutomation();
+        for (AppPrefs.FixedAlarm alarm : prefs.getFixedAlarms()) {
+            ScheduleManager.cancel(this, alarm.id);
+        }
     }
 
     @Override
@@ -122,17 +150,34 @@ public final class MainActivity extends Activity {
     @Override
     protected void onStart() {
         super.onStart();
+        runtimeSnapshot = TrackingService.getRuntimeSnapshot();
         statusReceiver = new BroadcastReceiver() {
-            @Override public void onReceive(Context context, Intent intent) { refreshUi(); }
+            @Override public void onReceive(Context context, Intent intent) {
+                runtimeSnapshot = TrackingService.getRuntimeSnapshot();
+                refreshUi();
+            }
         };
         IntentFilter filter = new IntentFilter(TrackingService.ACTION_STATUS);
-        registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        registerStatusReceiver(filter);
         refreshUi();
+        runtimeHandler.post(runtimeRefresh);
+    }
+
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
+    private void registerStatusReceiver(IntentFilter filter) {
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(statusReceiver, filter, TrackingService.PERMISSION_STATUS, null, Context.RECEIVER_NOT_EXPORTED);
+            return;
+        }
+        // RECEIVER_NOT_EXPORTED does not exist before API 33; the signature permission
+        // provides the equivalent sender restriction for the supported API 26-32 range.
+        registerReceiver(statusReceiver, filter, TrackingService.PERMISSION_STATUS, null);
     }
 
     @Override
     protected void onStop() {
         super.onStop();
+        runtimeHandler.removeCallbacks(runtimeRefresh);
         if (statusReceiver != null) unregisterReceiver(statusReceiver);
         statusReceiver = null;
     }
@@ -244,93 +289,25 @@ public final class MainActivity extends Activity {
         activeCard.setBackground(roundRect(SURFACE, 20, SEPARATOR));
         activeCard.setElevation(dp(1));
         LinearLayout activeCopy = column();
-        TextView activeLabel = text("●  正在守候", 12, Typeface.BOLD, GREEN);
+        activeLabel = text("●  正在守候", 12, Typeface.BOLD, GREEN);
         activeName = text("—", 19, Typeface.BOLD, INK);
         activeMeta = text("等待定位", 13, Typeface.NORMAL, MUTED);
         activeName.setPadding(0, dp(4), 0, dp(3));
         activeCopy.addView(activeLabel, matchWrap());
         activeCopy.addView(activeName, matchWrap());
         activeCopy.addView(activeMeta, matchWrap());
-        Button stop = dangerButton("停止");
-        stop.setOnClickListener(new View.OnClickListener() {
+        activeAction = dangerButton("停止");
+        activeAction.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View view) {
                 view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
                 stopReminder();
             }
         });
         activeCard.addView(activeCopy, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
-        activeCard.addView(stop, new LinearLayout.LayoutParams(dp(66), dp(40)));
+        activeCard.addView(activeAction, new LinearLayout.LayoutParams(dp(66), dp(40)));
         LinearLayout.LayoutParams activeParams = matchWrap();
         activeParams.topMargin = dp(14);
         root.addView(activeCard, activeParams);
-
-        TextView automaticTitle = sectionTitle("自动提醒");
-        LinearLayout.LayoutParams automaticTitleParams = matchWrap();
-        automaticTitleParams.topMargin = dp(30);
-        automaticTitleParams.bottomMargin = dp(10);
-        root.addView(automaticTitle, automaticTitleParams);
-
-        LinearLayout automaticCard = row();
-        automaticCard.setGravity(Gravity.CENTER_VERTICAL);
-        automaticCard.setPadding(dp(14), dp(12), dp(12), dp(12));
-        automaticCard.setBackground(roundRect(SURFACE, 18, SEPARATOR));
-        automaticCard.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View view) {
-                view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
-                showSettings();
-            }
-        });
-        applyPressFeedback(automaticCard);
-        TextView automaticIcon = text("✦", 18, Typeface.BOLD, GREEN);
-        automaticIcon.setGravity(Gravity.CENTER);
-        automaticIcon.setBackground(roundRect(SOFT_BLUE, 11, Color.TRANSPARENT));
-        LinearLayout automaticCopy = column();
-        TextView automaticName = text("出行检测", 16, Typeface.BOLD, INK);
-        journeyStatus = text("检查状态中", 13, Typeface.NORMAL, MUTED);
-        journeyStatus.setPadding(0, dp(2), 0, 0);
-        automaticCopy.addView(automaticName, matchWrap());
-        automaticCopy.addView(journeyStatus, matchWrap());
-        TextView chevron = text("›", 28, Typeface.NORMAL, MUTED);
-        chevron.setGravity(Gravity.CENTER);
-        automaticCard.addView(automaticIcon, new LinearLayout.LayoutParams(dp(38), dp(38)));
-        LinearLayout.LayoutParams automaticCopyParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1);
-        automaticCopyParams.leftMargin = dp(12);
-        automaticCard.addView(automaticCopy, automaticCopyParams);
-        automaticCard.addView(chevron, new LinearLayout.LayoutParams(dp(24), dp(40)));
-        root.addView(automaticCard, matchWrap());
-
-        TextView fixedTitle = sectionTitle("固定地点闹钟");
-        LinearLayout.LayoutParams fixedTitleParams = matchWrap();
-        fixedTitleParams.topMargin = dp(30);
-        fixedTitleParams.bottomMargin = dp(10);
-        root.addView(fixedTitle, fixedTitleParams);
-
-        LinearLayout fixedCard = row();
-        fixedCard.setGravity(Gravity.CENTER_VERTICAL);
-        fixedCard.setPadding(dp(14), dp(12), dp(12), dp(12));
-        fixedCard.setBackground(roundRect(SURFACE, 18, SEPARATOR));
-        fixedCard.setOnClickListener(view -> {
-            view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
-            showFixedAlarms();
-        });
-        applyPressFeedback(fixedCard);
-        TextView fixedIcon = text("时", 16, Typeface.BOLD, GREEN);
-        fixedIcon.setGravity(Gravity.CENTER);
-        fixedIcon.setBackground(roundRect(SOFT_BLUE, 11, Color.TRANSPARENT));
-        LinearLayout fixedCopy = column();
-        TextView fixedName = text("通勤预设", 16, Typeface.BOLD, INK);
-        fixedAlarmStatus = text("未设置 · 点按添加", 13, Typeface.NORMAL, MUTED);
-        fixedAlarmStatus.setPadding(0, dp(2), 0, 0);
-        fixedCopy.addView(fixedName, matchWrap());
-        fixedCopy.addView(fixedAlarmStatus, matchWrap());
-        TextView fixedChevron = text("›", 28, Typeface.NORMAL, MUTED);
-        fixedChevron.setGravity(Gravity.CENTER);
-        fixedCard.addView(fixedIcon, new LinearLayout.LayoutParams(dp(38), dp(38)));
-        LinearLayout.LayoutParams fixedCopyParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1);
-        fixedCopyParams.leftMargin = dp(12);
-        fixedCard.addView(fixedCopy, fixedCopyParams);
-        fixedCard.addView(fixedChevron, new LinearLayout.LayoutParams(dp(24), dp(40)));
-        root.addView(fixedCard, matchWrap());
 
         TextView recentTitle = sectionTitle("最近地点");
         LinearLayout.LayoutParams recentTitleParams = matchWrap();
@@ -378,7 +355,7 @@ public final class MainActivity extends Activity {
             return;
         }
         renderSuggestionMessage(!developerAmapKey().isEmpty() ? "高德正在确认地点…" : "地图正在确认地点…");
-        new Thread(new Runnable() {
+        suggestionFuture = placeSearchExecutor.submit(new Runnable() {
             @Override public void run() {
                 final List<AppPrefs.Destination> results = queryPlaces(query, 7);
                 runOnUiThread(new Runnable() {
@@ -393,7 +370,7 @@ public final class MainActivity extends Activity {
                     }
                 });
             }
-        }, "private-place-search").start();
+        });
     }
 
     private interface DestinationChoice { void select(AppPrefs.Destination destination); }
@@ -506,16 +483,20 @@ public final class MainActivity extends Activity {
         if (suggestionDebounce != null) destinationInput.removeCallbacks(suggestionDebounce);
         if (suggestionFuture != null) suggestionFuture.cancel(true);
         if (suggestionsList == null || query.isEmpty()) {
-            if (suggestionsList != null) suggestionsList.setVisibility(View.GONE);
+            suggestionRenderGate.reset();
+            if (suggestionsList != null && suggestionsList.getVisibility() != View.GONE) suggestionsList.setVisibility(View.GONE);
             return;
         }
         List<AppPrefs.Destination> local = localPlaceSuggestions(query);
         String cacheKey = query.toLowerCase(Locale.CHINA);
         List<AppPrefs.Destination> cached = suggestionCache.get(cacheKey);
         if (cached != null) local = mergePlaces(local, cached, 6);
-        renderPlaceSuggestions(local);
+        if (!local.isEmpty()) renderPlaceSuggestions(local);
         boolean amapEnabled = !developerAmapKey().isEmpty();
-        if (cached != null) return;
+        if (cached != null) {
+            if (local.isEmpty()) renderSuggestionMessage("暂未找到，试试“城市 + 地点名”");
+            return;
+        }
         if (query.length() < 2 && !amapEnabled) {
             if (local.isEmpty()) renderSuggestionMessage("再输入一个字，自动推荐相关地点");
             return;
@@ -544,7 +525,7 @@ public final class MainActivity extends Activity {
                 });
             }
         };
-        destinationInput.postDelayed(suggestionDebounce, amapEnabled ? 100 : 180);
+        destinationInput.postDelayed(suggestionDebounce, InteractionGate.searchDebounceMillis(amapEnabled));
     }
 
     private List<AppPrefs.Destination> mergePlaces(List<AppPrefs.Destination> first,
@@ -560,9 +541,7 @@ public final class MainActivity extends Activity {
         List<AppPrefs.Destination> results = new ArrayList<>();
         Set<String> ids = new HashSet<>();
         String needle = query.toLowerCase(Locale.CHINA);
-        List<AppPrefs.Destination> candidates = new ArrayList<>(prefs.getRecents());
-        for (AppPrefs.FixedAlarm alarm : prefs.getFixedAlarms()) candidates.add(alarm.destination);
-        for (AppPrefs.Destination item : candidates) {
+        for (AppPrefs.Destination item : localSuggestionCandidates) {
             String text = (item.name + " " + item.city + " " + item.address).toLowerCase(Locale.CHINA);
             if (text.contains(needle) && ids.add(item.id)) results.add(item);
             if (results.size() >= 4) break;
@@ -572,6 +551,11 @@ public final class MainActivity extends Activity {
 
     private void renderPlaceSuggestions(List<AppPrefs.Destination> places) {
         if (suggestionsList == null) return;
+        StringBuilder renderKey = new StringBuilder("places:");
+        for (AppPrefs.Destination place : places) renderKey.append(place.id).append('|');
+        String nextKey = renderKey.toString();
+        boolean visible = suggestionsList.getVisibility() == View.VISIBLE;
+        if (!suggestionRenderGate.shouldRender(nextKey, visible, !places.isEmpty())) return;
         suggestionsList.removeAllViews();
         suggestionsList.setVisibility(places.isEmpty() ? View.GONE : View.VISIBLE);
         if (places.isEmpty()) return;
@@ -610,6 +594,7 @@ public final class MainActivity extends Activity {
             item.setOnClickListener(view -> {
                 view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
                 suggestionGeneration++;
+                suggestionRenderGate.reset();
                 destinationInput.setText("");
                 suggestionsList.setVisibility(View.GONE);
                 chooseSuggestedDestination(place);
@@ -628,6 +613,9 @@ public final class MainActivity extends Activity {
 
     private void renderSuggestionMessage(String message) {
         if (suggestionsList == null) return;
+        String nextKey = "message:" + message;
+        if (!suggestionRenderGate.shouldRender(nextKey,
+                suggestionsList.getVisibility() == View.VISIBLE, true)) return;
         suggestionsList.removeAllViews();
         suggestionsList.setVisibility(View.VISIBLE);
         TextView status = text(message, 13, Typeface.NORMAL, MUTED);
@@ -662,27 +650,58 @@ public final class MainActivity extends Activity {
     private void startPendingDestination() {
         if (pendingDestination == null) return;
         long now = System.currentTimeMillis();
-        AppPrefs.ReminderTask task = new AppPrefs.ReminderTask("task-" + now, pendingDestination, prefs.getRadius(), "active", now);
+        AppPrefs.ReminderTask task = new AppPrefs.ReminderTask("task-" + now, pendingDestination, prefs.getRadius(), AppPrefs.ReminderTask.STATUS_ACTIVE, now);
         prefs.saveTask(task);
         prefs.addRecent(pendingDestination);
-        Intent service = new Intent(this, TrackingService.class).setAction(TrackingService.ACTION_START_REMINDER);
-        startForegroundService(service);
+        boolean started = ReminderRuntimeCoordinator.startReminder(this);
         destinationInput.setText("");
         pendingDestination = null;
+        runtimeSnapshot = TrackingService.getRuntimeSnapshot();
         refreshUi();
-        toast("已开始守候 " + task.destination.name);
-        maybeRequestFullScreenIntentAccess();
+        toast(started ? "正在启动守候 " + task.destination.name : "守候启动失败，请检查权限和定位设置");
     }
 
     private void stopReminder() {
-        Intent service = new Intent(this, TrackingService.class).setAction(TrackingService.ACTION_STOP_REMINDER);
-        startService(service);
-        prefs.clearTask();
+        ReminderRuntimeCoordinator.stopReminder(this);
+        runtimeSnapshot = TrackingService.getRuntimeSnapshot();
+        renderedReminderState = null;
         refreshUi();
         toast("已停止提醒");
     }
 
+    private void resumeReminder() {
+        AppPrefs.ReminderTask task = prefs.getTask();
+        if (task == null) return;
+        if (!hasCorePermissions()) {
+            pendingResume = true;
+            requestCorePermissions();
+            return;
+        }
+        resumeReminderNow();
+    }
+
+    private void resumeReminderNow() {
+        AppPrefs.ReminderTask task = prefs.getTask();
+        if (task == null) return;
+        boolean started = ReminderRuntimeCoordinator.resumeReminder(this);
+        runtimeSnapshot = TrackingService.getRuntimeSnapshot();
+        refreshUi();
+        toast(started ? "正在恢复守候 " + task.destination.name : "恢复失败，请检查权限和定位设置");
+    }
+
     private void requestCorePermissions() {
+        showStyledDialog(new AlertDialog.Builder(this)
+                .setTitle("允许到站守候所需权限")
+                .setMessage("你主动开始提醒后，应用会使用精确位置计算与目的地的距离；即使锁屏或离开应用也会继续，并持续显示系统通知。停止提醒或到站触发后会停止位置更新。到站距离在本机计算。")
+                .setNegativeButton("暂不", (dialog, which) -> {
+                    pendingDestination = null;
+                    pendingJourneyEnable = false;
+                    pendingResume = false;
+                })
+                .setPositiveButton("继续", (dialog, which) -> requestCorePermissionsNow()));
+    }
+
+    private void requestCorePermissionsNow() {
         List<String> permissions = new ArrayList<>();
         permissions.add(Manifest.permission.ACCESS_FINE_LOCATION);
         permissions.add(Manifest.permission.ACCESS_COARSE_LOCATION);
@@ -697,17 +716,24 @@ public final class MainActivity extends Activity {
         if (!hasLocationPermission()) {
             pendingDestination = null;
             pendingJourneyEnable = false;
+            pendingResume = false;
             toast("必须允许精确定位才能提醒到站");
             return;
         }
         if (!hasNotificationPermission()) {
             pendingDestination = null;
             pendingJourneyEnable = false;
+            pendingResume = false;
             toast("必须允许通知才能弹出到站闹钟");
             return;
         }
-        if (pendingJourneyEnable) { pendingJourneyEnable = false; enableJourneyService(); }
-        else startPendingDestination();
+        if (pendingResume) {
+            pendingResume = false;
+            resumeReminderNow();
+            return;
+        }
+        pendingJourneyEnable = false;
+        startPendingDestination();
     }
 
     private boolean hasLocationPermission() {
@@ -722,26 +748,6 @@ public final class MainActivity extends Activity {
 
     private void handleIntent(Intent intent) {
         if (intent == null) return;
-        String fixedAlarmId = intent.getStringExtra(FixedAlarmReceiver.EXTRA_FIXED_ALARM_ID);
-        if (fixedAlarmId != null) {
-            intent.removeExtra(FixedAlarmReceiver.EXTRA_FIXED_ALARM_ID);
-            AppPrefs.FixedAlarm alarm = prefs.getFixedAlarm(fixedAlarmId);
-            if (alarm != null) {
-                beginDestination(alarm.destination);
-                return;
-            }
-        }
-        if (intent.getBooleanExtra(TrackingService.EXTRA_FOCUS_DESTINATION, false)) {
-            CoreLogic.JourneyDetector detector = prefs.getJourneyDetector();
-            if (detector != null && CoreLogic.JourneyDetector.PROMOTED.equals(detector.state)) {
-                detector.state = CoreLogic.JourneyDetector.WAITING;
-                prefs.setJourneyRuntime(detector);
-            }
-            destinationInput.requestFocus();
-            destinationInput.postDelayed(new Runnable() {
-                @Override public void run() { showKeyboard(); }
-            }, 250);
-        }
         ShareParser.ParsedShare shared = ShareParser.fromIntent(intent);
         if (shared == null) {
             if (ShareParser.isTravelWebsite(intent)) {
@@ -836,41 +842,96 @@ public final class MainActivity extends Activity {
 
     private void refreshUi() {
         if (activeCard == null) return;
-        AppPrefs.ReminderTask task = prefs.getTask();
-        activeCard.setVisibility(task == null ? View.GONE : View.VISIBLE);
-        if (task != null) {
+        runtimeSnapshot = TrackingService.getRuntimeSnapshot();
+        ReminderRuntimeCoordinator.Status reminderStatus = ReminderRuntimeCoordinator.reconcile(
+                this, runtimeSnapshot, SystemClock.elapsedRealtime());
+        AppPrefs.ReminderTask task = reminderStatus.task;
+        ReminderStateLogic.State state = reminderStatus.state;
+        if (task == null) {
+            ReminderRuntimeCoordinator.cancelRestoreNotification(this);
+            renderedReminderState = null;
+            activeCard.setVisibility(View.GONE);
+        } else {
+            activeCard.setVisibility(View.VISIBLE);
             activeName.setText(task.destination.name);
-            if ("alerting".equals(task.status)) activeMeta.setText("已触发提醒 · 等待确认");
-            else if (!Double.isNaN(task.lastDistanceMeters)) activeMeta.setText("距离约 " + formatDistance(task.lastDistanceMeters) + " · " + formatRadius(task.radiusMeters) + " 时提醒");
-            else activeMeta.setText("等待定位 · " + formatRadius(task.radiusMeters) + " 时提醒");
+            if (state == ReminderStateLogic.State.NEEDS_RESUME) {
+                activeLabel.setText("●  需要恢复");
+                activeLabel.setTextColor(DANGER);
+                activeMeta.setText("监控已中断，请点恢复继续守候");
+                activeAction.setText("恢复");
+                activeAction.setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View view) {
+                        view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+                        resumeReminder();
+                    }
+                });
+                if (renderedReminderState != state) {
+                    ReminderRuntimeCoordinator.showRestoreNotification(this, task, "");
+                }
+            } else if (state == ReminderStateLogic.State.STARTING) {
+                activeLabel.setText("●  正在启动");
+                activeLabel.setTextColor(GREEN);
+                activeMeta.setText("正在建立定位监听");
+                activeAction.setText("停止");
+                activeAction.setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View view) {
+                        view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+                        stopReminder();
+                    }
+                });
+                ReminderRuntimeCoordinator.cancelRestoreNotification(this);
+            } else if (state == ReminderStateLogic.State.WAITING_LOCATION) {
+                activeLabel.setText("●  等待定位");
+                activeLabel.setTextColor(MUTED);
+                activeMeta.setText("定位监听已建立，等待首个定位 · " + formatRadius(task.radiusMeters) + " 时提醒");
+                activeAction.setText("停止");
+                activeAction.setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View view) {
+                        view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+                        stopReminder();
+                    }
+                });
+                ReminderRuntimeCoordinator.cancelRestoreNotification(this);
+            } else if (state == ReminderStateLogic.State.ALERTING) {
+                activeLabel.setText("●  已触发提醒");
+                activeLabel.setTextColor(GREEN);
+                activeMeta.setText("已触发提醒 · 等待确认");
+                activeAction.setText("停止");
+                activeAction.setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View view) {
+                        view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+                        stopReminder();
+                    }
+                });
+                ReminderRuntimeCoordinator.cancelRestoreNotification(this);
+            } else {
+                activeLabel.setText("●  正在守候");
+                activeLabel.setTextColor(GREEN);
+                if (!Double.isNaN(task.lastDistanceMeters)) activeMeta.setText("距离约 " + formatDistance(task.lastDistanceMeters) + " · " + formatRadius(task.radiusMeters) + " 时提醒");
+                else activeMeta.setText("等待定位 · " + formatRadius(task.radiusMeters) + " 时提醒");
+                activeAction.setText("停止");
+                activeAction.setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View view) {
+                        view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+                        stopReminder();
+                    }
+                });
+                ReminderRuntimeCoordinator.cancelRestoreNotification(this);
+            }
+            renderedReminderState = state;
         }
-        if (!prefs.isJourneyEnabled()) journeyStatus.setText("已关闭 · 点按开启");
-        else if (prefs.isAppWatchEnabled() && !hasUsageAccess()) journeyStatus.setText("需要授权出行 App 识别");
-        else if (prefs.isTransitWatchEnabled() && !hasNotificationAccess()) journeyStatus.setText("需要授权进站通知识别");
-        else if (prefs.isStationWatchEnabled() || prefs.isAppWatchEnabled() || prefs.isTransitWatchEnabled()) journeyStatus.setText("车站、地图与乘车信号待命");
-        else journeyStatus.setText("乘车信号检测中");
-        List<AppPrefs.FixedAlarm> fixedAlarms = prefs.getFixedAlarms();
-        int enabledCount = 0;
-        AppPrefs.FixedAlarm firstEnabled = null;
-        for (AppPrefs.FixedAlarm alarm : fixedAlarms) if (alarm.enabled) {
-            enabledCount++;
-            if (firstEnabled == null) firstEnabled = alarm;
-        }
-        if (fixedAlarmStatus != null) {
-            if (fixedAlarms.isEmpty()) fixedAlarmStatus.setText("未设置 · 点按添加");
-            else if (!hasFixedAlarmPermissions()) fixedAlarmStatus.setText("已保存 · 需要完成自动启动权限");
-            else if (enabledCount == 0) fixedAlarmStatus.setText(fixedAlarms.size() + " 个日程 · 均已暂停");
-            else if (enabledCount == 1) fixedAlarmStatus.setText(firstEnabled.destination.name + " · "
-                    + ScheduleLogic.daysLabel(firstEnabled.daysMask) + " " + ScheduleLogic.timeLabel(firstEnabled.hour, firstEnabled.minute));
-            else fixedAlarmStatus.setText(enabledCount + " 个日程正在自动预设");
-        }
-        renderRecents();
+        List<AppPrefs.Destination> recents = prefs.getRecents();
+        localSuggestionCandidates = new ArrayList<>(recents);
+        renderRecents(recents);
     }
 
-    private void renderRecents() {
+    private void renderRecents(List<AppPrefs.Destination> recents) {
         if (recentsList == null) return;
+        StringBuilder key = new StringBuilder();
+        for (AppPrefs.Destination place : recents) key.append(place.id).append('|').append(place.name).append(';');
+        String nextKey = key.toString();
+        if (!recentsRenderGate.shouldRender(nextKey, recentsList.getChildCount() > 0, true)) return;
         recentsList.removeAllViews();
-        List<AppPrefs.Destination> recents = prefs.getRecents();
         if (recents.isEmpty()) {
             TextView empty = text("暂无最近地点", 14, Typeface.NORMAL, MUTED);
             empty.setGravity(Gravity.CENTER_VERTICAL);
@@ -1093,36 +1154,20 @@ public final class MainActivity extends Activity {
             @Override public void onStartTrackingTouch(SeekBar seekBar) {}
             @Override public void onStopTrackingTouch(SeekBar seekBar) {}
         });
-        final Switch journey = iosSwitch("乘车时提醒设置目的地", prefs.isJourneyEnabled());
-        final Switch stationWatch = iosSwitch("靠近地铁站或火车站时提醒", prefs.isStationWatchEnabled());
-        final Switch appWatch = iosSwitch("打开地图或打车 App 时提醒", prefs.isAppWatchEnabled());
-        final Switch transitWatch = iosSwitch("导航、交通卡和进站通知触发", prefs.isTransitWatchEnabled());
-        TextView privacy = text("地点搜索会自动使用地图 POI 服务，不要求用户配置密钥。搜索关键词及可选的附近坐标会发送给地点服务；出行 App 与交通关键词识别仍只在本机处理。", 13, Typeface.NORMAL, MUTED);
+        TextView privacy = text("地点搜索会使用地图 POI 服务。搜索关键词及可选的附近坐标会发送给地点服务；到站距离只在本机计算。", 13, Typeface.NORMAL, MUTED);
         privacy.setLineSpacing(dp(3), 1f);
         privacy.setPadding(0, dp(16), 0, dp(6));
         content.addView(radiusLabel, matchWrap());
         content.addView(radius, matchWrap());
-        content.addView(journey, matchWrap());
-        content.addView(stationWatch, matchWrap());
-        content.addView(appWatch, matchWrap());
-        content.addView(transitWatch, matchWrap());
         content.addView(privacy, matchWrap());
         ScrollView settingsScroll = new ScrollView(this);
         settingsScroll.setVerticalScrollBarEnabled(false);
         settingsScroll.addView(content, matchWrap());
-        showStyledDialog(new AlertDialog.Builder(this).setTitle("自动提醒与隐私").setView(settingsScroll)
+        showStyledDialog(new AlertDialog.Builder(this).setTitle("提醒设置与隐私").setView(settingsScroll)
                 .setNeutralButton("清空数据", (dialog, which) -> confirmClearData())
                 .setNegativeButton("取消", null)
                 .setPositiveButton("保存", (dialog, which) -> {
                     prefs.setRadius(300 + radius.getProgress() * 100);
-                    prefs.setStationWatchEnabled(stationWatch.isChecked());
-                    prefs.setAppWatchEnabled(appWatch.isChecked());
-                    prefs.setTransitWatchEnabled(transitWatch.isChecked());
-                    boolean wantsJourney = journey.isChecked() || stationWatch.isChecked() || appWatch.isChecked() || transitWatch.isChecked();
-                    if (wantsJourney && !prefs.isJourneyEnabled()) requestEnableJourney();
-                    else if (!wantsJourney && prefs.isJourneyEnabled()) disableJourneyService();
-                    if (appWatch.isChecked() && !hasUsageAccess()) explainAndRequestUsageAccess();
-                    else if (transitWatch.isChecked() && !hasNotificationAccess()) explainAndRequestNotificationAccess();
                     refreshUi();
                 }));
     }
@@ -1140,12 +1185,18 @@ public final class MainActivity extends Activity {
     }
 
     private void showPrivacy() {
-        String message = "只在活动到站提醒或你主动开启乘车提示时使用位置。\n\n" +
+        String message = "只在你主动开始到站提醒后使用位置；停止提醒后立即停止定位。\n\n" +
                 "地点候选默认由 Photon/OpenStreetMap 提供；若开发者构建时配置了高德服务，则优先使用高德。搜索关键词和可选的附近坐标会直接发送给地点服务，结果仅做本机会话缓存；应用没有自己的业务服务器。\n\n" +
-                "固定通勤地点、时间和启用状态只保存在本机；系统仅在指定时间唤醒日程。\n\n" +
-                "地图和打车地点可由你主动分享。可选的使用情况访问只判断受支持的出行 App 是否刚被打开；可选的通知使用权只在内存中过滤导航、交通卡、进站和检票关键词。不会保存通知正文或完整使用记录。\n\n" +
+                "目的地、最近地点、提醒半径和设置只保存在本机。应用不读取其他 App 的通知或使用记录。\n\n" +
                 "强制结束应用、关闭定位、静音/勿扰或地下无信号时，闹钟可能无法触发。";
-        showStyledDialog(new AlertDialog.Builder(this).setTitle("隐私与能力边界").setMessage(message).setPositiveButton("知道了", null));
+        showStyledDialog(new AlertDialog.Builder(this).setTitle("隐私与能力边界").setMessage(message)
+                .setNeutralButton("在线隐私政策", (dialog, which) -> openPrivacyPolicy())
+                .setPositiveButton("知道了", null));
+    }
+
+    private void openPrivacyPolicy() {
+        try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(PRIVACY_POLICY_URL))); }
+        catch (Exception ignored) { toast("暂时无法打开在线隐私政策"); }
     }
 
     private boolean hasUsageAccess() {
@@ -1293,9 +1344,11 @@ public final class MainActivity extends Activity {
         view.setOnTouchListener(new View.OnTouchListener() {
             @Override public boolean onTouch(View target, MotionEvent event) {
                 if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
-                    target.animate().scaleX(0.98f).scaleY(0.98f).setDuration(45).start();
+                    target.animate().cancel();
+                    target.animate().scaleX(0.985f).scaleY(0.985f).setDuration(35).start();
                 } else if (event.getActionMasked() == MotionEvent.ACTION_UP || event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
-                    target.animate().scaleX(1f).scaleY(1f).setDuration(120).setInterpolator(new DecelerateInterpolator()).start();
+                    target.animate().cancel();
+                    target.animate().scaleX(1f).scaleY(1f).setDuration(90).setInterpolator(new DecelerateInterpolator()).start();
                 }
                 return false;
             }

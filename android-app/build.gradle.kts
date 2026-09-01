@@ -112,6 +112,30 @@ android {
 
 val bundletool by configurations.creating
 
+val verifyReleasePermissionScope by tasks.registering {
+    group = "verification"
+    description = "Fails when deferred high-risk permissions or components return to the first Play release."
+    val manifestFile = layout.projectDirectory.file("AndroidManifest.xml")
+    inputs.file(manifestFile)
+    doLast {
+        val manifest = manifestFile.asFile.readText()
+        val forbiddenEntries = listOf(
+            "android.permission.ACCESS_BACKGROUND_LOCATION",
+            "android.permission.PACKAGE_USAGE_STATS",
+            "android.permission.USE_FULL_SCREEN_INTENT",
+            "android.permission.SCHEDULE_EXACT_ALARM",
+            "android.permission.RECEIVE_BOOT_COMPLETED",
+            ".TransitNotificationListener",
+            ".FixedAlarmReceiver",
+            ".BootReceiver",
+        )
+        val present = forbiddenEntries.filter(manifest::contains)
+        require(present.isEmpty()) {
+            "First-release permission scope contains deferred entries: ${present.joinToString()}"
+        }
+    }
+}
+
 dependencies {
     testImplementation("junit:junit:4.13.2")
     bundletool("com.android.tools.build:bundletool:1.18.3")
@@ -124,7 +148,7 @@ dependencyLocking {
 tasks.register<JavaExec>("validateReleaseBundle") {
     group = "verification"
     description = "Validates the generated release Android App Bundle with bundletool."
-    dependsOn("bundleRelease")
+    dependsOn("bundleRelease", verifyReleasePermissionScope)
     classpath = bundletool
     mainClass.set("com.android.tools.build.bundletool.BundleToolMain")
     doFirst {

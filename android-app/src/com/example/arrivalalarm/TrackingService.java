@@ -28,6 +28,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.Process;
+import android.os.SystemClock;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 
@@ -45,11 +46,15 @@ public final class TrackingService extends Service implements LocationListener {
     public static final String ACTION_DISABLE_JOURNEY = "com.example.arrivalalarm.DISABLE_JOURNEY";
     public static final String ACTION_CLEAR_ALL = "com.example.arrivalalarm.CLEAR_ALL";
     public static final String ACTION_STATUS = "com.example.arrivalalarm.STATUS";
+    public static final String PERMISSION_STATUS = BuildConfig.APPLICATION_ID + ".permission.INTERNAL_STATUS";
     public static final String EXTRA_FOCUS_DESTINATION = "focus_destination";
 
     private static final String CHANNEL_TRACKING = "tracking";
     private static final String CHANNEL_ALARM = "arrival_alarm";
     private static final int FOREGROUND_ID = 100;
+    private static final long REMINDER_HEARTBEAT_INTERVAL_MS = 60_000L;
+    private static volatile ReminderRuntime.Snapshot runtimeSnapshot = ReminderRuntime.Snapshot.stopped();
+    private static volatile long runtimeGeneration;
     private static final Set<String> TRAVEL_PACKAGES = new HashSet<>(Arrays.asList(
             "com.autonavi.minimap", "com.baidu.BaiduMap", "com.tencent.map",
             "com.sdu.didi.psnger", "com.sdu.didi.gsui", "com.sankuai.meituan",
@@ -70,6 +75,9 @@ public final class TrackingService extends Service implements LocationListener {
     private long lastUsageCheckAt;
     private long lastStationLookupAt;
     private boolean stationLookupInFlight;
+    private final ReminderProviderRegistry providerRegistry = new ReminderProviderRegistry();
+    private long serviceGeneration;
+    private boolean acceptingLocationCallbacks;
 
     private final Runnable usageCheck = new Runnable() {
         @Override public void run() {
@@ -81,7 +89,7 @@ public final class TrackingService extends Service implements LocationListener {
     private final Runnable alarmPulse = new Runnable() {
         @Override public void run() {
             AppPrefs.ReminderTask task = prefs.getTask();
-            if (task == null || !"alerting".equals(task.status) || alarmCount >= 10) {
+            if (task == null || !task.isAlerting() || alarmCount >= 10) {
                 stopAlarmSound();
                 return;
             }
@@ -91,10 +99,23 @@ public final class TrackingService extends Service implements LocationListener {
         }
     };
 
+    private final Runnable reminderHeartbeat = new Runnable() {
+        @Override public void run() {
+            if (!ownsCurrentRuntime()) return;
+            AppPrefs.ReminderTask task = prefs.getTask();
+            if (task == null || task.isInterrupted()) return;
+            publishRuntime(runtimeSnapshot.heartbeat(SystemClock.elapsedRealtime()));
+            handler.postDelayed(this, REMINDER_HEARTBEAT_INTERVAL_MS);
+        }
+    };
+
     @Override
     public void onCreate() {
         super.onCreate();
+        serviceGeneration = runtimeGeneration;
+        runtimeSnapshot = ReminderRuntime.Snapshot.starting(SystemClock.elapsedRealtime());
         prefs = new AppPrefs(this);
+        prefs.disableDeferredAutomation();
         locationManager = (LocationManager) getSystemService(LOCATION_SERVICE);
         notifications = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         createChannels();
@@ -102,6 +123,7 @@ public final class TrackingService extends Service implements LocationListener {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        serviceGeneration = runtimeGeneration;
         String action = intent == null ? null : intent.getAction();
         if (ACTION_STOP_REMINDER.equals(action)) {
             prefs.clearTask();
@@ -109,8 +131,8 @@ public final class TrackingService extends Service implements LocationListener {
             stopAlarmSound();
             restoreModeOrStop();
         } else if (ACTION_ENABLE_JOURNEY.equals(action)) {
-            prefs.setJourneyEnabled(true);
-            startJourneyMode();
+            prefs.disableDeferredAutomation();
+            if (prefs.getTask() == null) stopEverything();
         } else if (ACTION_DISABLE_JOURNEY.equals(action)) {
             prefs.setJourneyEnabled(false);
             journeyDetector = null;
@@ -121,24 +143,42 @@ public final class TrackingService extends Service implements LocationListener {
         } else {
             AppPrefs.ReminderTask task = prefs.getTask();
             if (task != null) startReminderMode(task);
-            else if (prefs.isJourneyEnabled()) startJourneyMode();
             else stopEverything();
         }
         sendStatus();
-        return START_STICKY;
+        return START_NOT_STICKY;
     }
 
     private void startReminderMode(AppPrefs.ReminderTask task) {
         handler.removeCallbacks(usageCheck);
         journeyDetector = null;
-        if ("alerting".equals(task.status)) {
+        if (task.isInterrupted()) {
+            stopEverything();
+            return;
+        }
+        startReminderHeartbeat();
+        if (task.isAlerting()) {
             removeLocationUpdates();
-            startForeground(FOREGROUND_ID, buildAlarmNotification(task));
+            try {
+                startForeground(FOREGROUND_ID, buildAlarmNotification(task));
+            } catch (RuntimeException failed) {
+                failReminder(ReminderRuntime.Failure.FOREGROUND_START, "系统暂时不允许启动定位服务。");
+                return;
+            }
+            publishRuntime(ReminderRuntime.Snapshot.foreground(
+                    SystemClock.elapsedRealtime(), SystemClock.elapsedRealtime()));
             startAlarmSound();
             return;
         }
         arrivalTracker = new CoreLogic.ArrivalTracker(task.destination.latitude, task.destination.longitude, task.radiusMeters);
-        startForeground(FOREGROUND_ID, buildTrackingNotification(task));
+        try {
+            startForeground(FOREGROUND_ID, buildTrackingNotification(task));
+        } catch (RuntimeException failed) {
+            failReminder(ReminderRuntime.Failure.FOREGROUND_START, "系统暂时不允许启动定位服务。");
+            return;
+        }
+        publishRuntime(ReminderRuntime.Snapshot.foreground(
+                SystemClock.elapsedRealtime(), SystemClock.elapsedRealtime()));
         requestLocationUpdates(true);
     }
 
@@ -153,13 +193,17 @@ public final class TrackingService extends Service implements LocationListener {
     }
 
     private void restoreModeOrStop() {
-        if (prefs.isJourneyEnabled()) startJourneyMode();
-        else stopEverything();
+        stopEverything();
     }
 
     private void requestLocationUpdates(boolean precise) {
+        if (!ownsCurrentRuntime()) return;
         if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            stopEverything();
+            failReminder(ReminderRuntime.Failure.LOCATION_PERMISSION, "请重新允许精确定位。");
+            return;
+        }
+        if (locationManager == null) {
+            failReminder(ReminderRuntime.Failure.LOCATION_LISTENER, "设备没有可用的定位服务。");
             return;
         }
         removeLocationUpdates();
@@ -168,26 +212,60 @@ public final class TrackingService extends Service implements LocationListener {
         try {
             if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
                 locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, minTime, minDistance, this, Looper.getMainLooper());
+                providerRegistry.add(LocationManager.GPS_PROVIDER);
             }
             if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
                 locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, precise ? 15_000L : minTime, precise ? 50f : minDistance, this, Looper.getMainLooper());
+                providerRegistry.add(LocationManager.NETWORK_PROVIDER);
             }
-        } catch (SecurityException ignored) { stopEverything(); }
+        } catch (SecurityException ignored) {
+            failReminder(ReminderRuntime.Failure.LOCATION_PERMISSION, "请重新允许精确定位。");
+            return;
+        } catch (IllegalArgumentException ignored) {
+            if (providerRegistry.count() == 0) {
+                failReminder(ReminderRuntime.Failure.LOCATION_LISTENER, "设备暂时无法建立定位监听。");
+                return;
+            }
+        }
+        if (providerRegistry.count() == 0) {
+            failReminder(ReminderRuntime.Failure.NO_LOCATION_PROVIDER, "请打开定位后再恢复守候。");
+            return;
+        }
+        long now = SystemClock.elapsedRealtime();
+        acceptingLocationCallbacks = true;
+        publishRuntime(ReminderRuntime.Snapshot.locationReady(providerRegistry.count(), now, now, 0L));
     }
 
     @Override
     public void onLocationChanged(Location location) {
+        if (location == null || !ownsCurrentRuntime() || !acceptingLocationCallbacks) return;
+        AppPrefs.ReminderTask task = prefs.getTask();
+        if (task == null || !task.isActive() || providerRegistry.count() == 0) return;
+        long nowElapsedRealtime = SystemClock.elapsedRealtime();
+        publishRuntime(runtimeSnapshot.locationReceived(nowElapsedRealtime));
         float accuracy = location.hasAccuracy() ? location.getAccuracy() : Float.MAX_VALUE;
         float speed = location.hasSpeed() ? location.getSpeed() : -1f;
         long timestamp = location.getTime() > 0 ? location.getTime() : System.currentTimeMillis();
         CoreLogic.LocationFix fix = new CoreLogic.LocationFix(location.getLatitude(), location.getLongitude(), accuracy, speed, timestamp);
-        AppPrefs.ReminderTask task = prefs.getTask();
-        if (task != null && "active".equals(task.status)) processReminder(task, fix);
-        else if (task == null && prefs.isJourneyEnabled()) processJourney(fix);
+        processReminder(task, fix);
     }
 
-    @Override public void onProviderEnabled(String provider) {}
-    @Override public void onProviderDisabled(String provider) { sendStatus(); }
+    @Override public void onProviderEnabled(String provider) {
+        AppPrefs.ReminderTask task = prefs.getTask();
+        if (ownsCurrentRuntime() && task != null && task.isActive()) requestLocationUpdates(true);
+    }
+    @Override public void onProviderDisabled(String provider) {
+        AppPrefs.ReminderTask task = prefs.getTask();
+        if (!ownsCurrentRuntime() || !acceptingLocationCallbacks || task == null || !task.isActive()) return;
+        if (!providerRegistry.remove(provider)) return;
+        if (providerRegistry.count() == 0) {
+            failReminder(ReminderRuntime.Failure.NO_LOCATION_PROVIDER, "请打开定位后再恢复守候。");
+        } else {
+            publishRuntime(ReminderRuntime.Snapshot.locationReady(
+                    providerRegistry.count(), runtimeSnapshot.stateSinceElapsedRealtime,
+                    runtimeSnapshot.lastHeartbeatElapsedRealtime, runtimeSnapshot.lastLocationElapsedRealtime));
+        }
+    }
     @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
 
     private void processReminder(AppPrefs.ReminderTask task, CoreLogic.LocationFix fix) {
@@ -201,11 +279,13 @@ public final class TrackingService extends Service implements LocationListener {
     }
 
     private void triggerArrival(AppPrefs.ReminderTask task) {
-        task.status = "alerting";
+        task.status = AppPrefs.ReminderTask.STATUS_ALERTING;
         task.triggeredAt = System.currentTimeMillis();
         prefs.saveTask(task);
         removeLocationUpdates();
         startForeground(FOREGROUND_ID, buildAlarmNotification(task));
+        publishRuntime(ReminderRuntime.Snapshot.foreground(
+                SystemClock.elapsedRealtime(), SystemClock.elapsedRealtime()));
         startAlarmSound();
         sendStatus();
     }
@@ -344,7 +424,7 @@ public final class TrackingService extends Service implements LocationListener {
 
     private Notification buildAlarmNotification(AppPrefs.ReminderTask task) {
         Intent alarm = new Intent(this, AlarmActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-        PendingIntent fullScreen = PendingIntent.getActivity(this, 40, alarm, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        PendingIntent content = PendingIntent.getActivity(this, 40, alarm, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         Intent arrivedIntent = new Intent(this, ActionReceiver.class).setAction(ActionReceiver.ACTION_ARRIVED);
         PendingIntent arrived = PendingIntent.getBroadcast(this, 41, arrivedIntent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         return new Notification.Builder(this, CHANNEL_ALARM)
@@ -356,15 +436,14 @@ public final class TrackingService extends Service implements LocationListener {
                 .setPriority(Notification.PRIORITY_MAX)
                 .setVisibility(Notification.VISIBILITY_PUBLIC)
                 .setOngoing(true)
-                .setContentIntent(fullScreen)
-                .setFullScreenIntent(fullScreen, true)
+                .setContentIntent(content)
                 .addAction(new Notification.Action.Builder(null, "我已到达", arrived).build())
                 .build();
     }
 
     private void createChannels() {
         NotificationChannel tracking = new NotificationChannel(CHANNEL_TRACKING, "行程监控", NotificationManager.IMPORTANCE_LOW);
-        tracking.setDescription("活动提醒或乘车检测期间显示");
+        tracking.setDescription("用户主动启动到站提醒后持续显示");
         tracking.setShowBadge(false);
         notifications.createNotificationChannel(tracking);
 
@@ -377,10 +456,8 @@ public final class TrackingService extends Service implements LocationListener {
         alarm.setSound(alarmUri, alarmAttributes);
         alarm.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
         notifications.createNotificationChannel(alarm);
+        notifications.deleteNotificationChannel(JourneyPrompt.CHANNEL_ID);
 
-        NotificationChannel journey = new NotificationChannel(JourneyPrompt.CHANNEL_ID, "出行提示", NotificationManager.IMPORTANCE_HIGH);
-        journey.setDescription("检测到乘车、导航或进站信号后询问是否设置目的地");
-        notifications.createNotificationChannel(journey);
     }
 
     private void startAlarmSound() {
@@ -415,19 +492,61 @@ public final class TrackingService extends Service implements LocationListener {
     }
 
     private void removeLocationUpdates() {
+        acceptingLocationCallbacks = false;
+        providerRegistry.clear();
+        if (locationManager == null) return;
         try { locationManager.removeUpdates(this); } catch (SecurityException ignored) { }
     }
 
     private void stopEverything() {
         handler.removeCallbacks(usageCheck);
+        stopReminderHeartbeat();
         removeLocationUpdates();
         stopAlarmSound();
         stopForeground(true);
+        publishRuntime(ReminderRuntime.Snapshot.stopped());
         stopSelf();
     }
 
+    private void startReminderHeartbeat() {
+        handler.removeCallbacks(reminderHeartbeat);
+        handler.postDelayed(reminderHeartbeat, REMINDER_HEARTBEAT_INTERVAL_MS);
+    }
+
+    private void stopReminderHeartbeat() {
+        handler.removeCallbacks(reminderHeartbeat);
+    }
+
     private void sendStatus() {
-        sendBroadcast(new Intent(ACTION_STATUS).setPackage(getPackageName()));
+        sendBroadcast(new Intent(ACTION_STATUS).setPackage(getPackageName())
+                .putExtra("runtime_state", runtimeSnapshot.state.name())
+                .putExtra("registered_provider_count", runtimeSnapshot.registeredProviderCount)
+                .putExtra("state_since_elapsed", runtimeSnapshot.stateSinceElapsedRealtime)
+                .putExtra("last_heartbeat_elapsed", runtimeSnapshot.lastHeartbeatElapsedRealtime)
+                .putExtra("last_location_elapsed", runtimeSnapshot.lastLocationElapsedRealtime)
+                .putExtra("failure", runtimeSnapshot.failure.name()), PERMISSION_STATUS);
+    }
+
+    private void failReminder(ReminderRuntime.Failure failure, String reason) {
+        if (!ownsCurrentRuntime()) return;
+        AppPrefs.ReminderTask task = prefs.getTask();
+        if (task != null && task.isActive()) {
+            task.markInterrupted();
+            prefs.saveTask(task);
+            ReminderRuntimeCoordinator.showRestoreNotification(this, task, reason);
+        }
+        publishRuntime(ReminderRuntime.Snapshot.failed(failure, SystemClock.elapsedRealtime()));
+        stopEverything();
+    }
+
+    private void publishRuntime(ReminderRuntime.Snapshot snapshot) {
+        if (!ownsCurrentRuntime()) return;
+        runtimeSnapshot = snapshot;
+        sendStatus();
+    }
+
+    private boolean ownsCurrentRuntime() {
+        return serviceGeneration == runtimeGeneration;
     }
 
     private String formatRadius(int meters) { return meters < 1000 ? meters + " 米" : (meters % 1000 == 0 ? String.valueOf(meters / 1000) : String.format(Locale.CHINA, "%.1f", meters / 1000f)) + " 公里"; }
@@ -438,8 +557,25 @@ public final class TrackingService extends Service implements LocationListener {
     @Override
     public void onDestroy() {
         handler.removeCallbacks(usageCheck);
+        stopReminderHeartbeat();
         removeLocationUpdates();
         stopAlarmSound();
+        if (ownsCurrentRuntime()) {
+            runtimeSnapshot = ReminderRuntime.Snapshot.stopped();
+            sendStatus();
+        }
         super.onDestroy();
     }
+
+    public static void markStartRequested() {
+        runtimeGeneration++;
+        runtimeSnapshot = ReminderRuntime.Snapshot.starting(SystemClock.elapsedRealtime());
+    }
+
+    public static void markStartFailed() {
+        runtimeSnapshot = ReminderRuntime.Snapshot.failed(
+                ReminderRuntime.Failure.FOREGROUND_START, SystemClock.elapsedRealtime());
+    }
+
+    public static ReminderRuntime.Snapshot getRuntimeSnapshot() { return runtimeSnapshot; }
 }

@@ -30,10 +30,15 @@ public final class CoreLogicTest {
         testFixedAlarmLaterToday();
         testFixedAlarmSkipsWeekend();
         testEverydayAlarmAdvances();
+        testReminderStateMachine();
+        testReminderProviderRegistry();
         testAmapCoordinateConversion();
         testRejectsBrokenSystemPlace();
         testAcceptsRelevantPlaceSuggestion();
         testRecoversTruncatedSystemPlaceName();
+        testRepeatedSuggestionStateRendersOnce();
+        testSuggestionGateResets();
+        testFastSearchDebounce();
         System.out.println("CoreLogicTest: " + passed + " tests passed");
     }
 
@@ -170,6 +175,47 @@ public final class CoreLogicTest {
         check(result.get(Calendar.DAY_OF_MONTH) == 25 && result.get(Calendar.HOUR_OF_DAY) == 8, "everyday advances");
     }
 
+    private static void testReminderStateMachine() {
+        AppPrefs.Destination destination = new AppPrefs.Destination("task-3", "杭州东站", "", "", 30.3065, 120.2048);
+        AppPrefs.ReminderTask task = new AppPrefs.ReminderTask("task-3", destination, 1000,
+                AppPrefs.ReminderTask.STATUS_ACTIVE, 1_000L);
+        ReminderRuntime.Snapshot starting = ReminderRuntime.Snapshot.starting(120_000L);
+        ReminderRuntime.Snapshot ready = ReminderRuntime.Snapshot.locationReady(1, 120_000L, 120_000L, 0L);
+        ReminderRuntime.Snapshot located = ready.locationReceived(120_001L);
+        ReminderRuntime.Snapshot stale = located.heartbeat(250_000L - ReminderRuntime.HEARTBEAT_TIMEOUT_MS - 1L);
+        check(ReminderStateLogic.classify(null, ReminderRuntime.Snapshot.stopped(), 120_000L) == ReminderStateLogic.State.EMPTY,
+                "empty reminder state");
+        check(ReminderStateLogic.classify(task, ReminderRuntime.Snapshot.stopped(), 120_000L) == ReminderStateLogic.State.NEEDS_RESUME,
+                "active task without service needs immediate resume");
+        check(ReminderStateLogic.classify(task, starting, 120_001L) == ReminderStateLogic.State.STARTING,
+                "start request is not monitoring");
+        check(ReminderStateLogic.classify(task, ready, 120_001L) == ReminderStateLogic.State.WAITING_LOCATION,
+                "registered listener waits for first location");
+        check(ReminderStateLogic.classify(task, ReminderRuntime.Snapshot.locationReady(0, 120_000L, 120_000L, 0L), 120_001L)
+                        == ReminderStateLogic.State.NEEDS_RESUME,
+                "no registered provider needs resume");
+        check(ReminderStateLogic.classify(task, ReminderRuntime.Snapshot.foreground(120_000L, 120_000L),
+                        120_001L) == ReminderStateLogic.State.WAITING_LOCATION,
+                "foreground startup waits briefly");
+        check(ReminderStateLogic.classify(task, ReminderRuntime.Snapshot.foreground(120_000L, 120_000L),
+                        120_000L + ReminderRuntime.START_TIMEOUT_MS + 1L) == ReminderStateLogic.State.NEEDS_RESUME,
+                "stalled foreground startup needs resume");
+        check(ReminderStateLogic.classify(task, located, 120_001L) == ReminderStateLogic.State.MONITORING,
+                "location-ready service is monitoring");
+        check(ReminderStateLogic.classify(task, stale, 250_000L) == ReminderStateLogic.State.NEEDS_RESUME,
+                "stale service heartbeat needs resume");
+        task.markInterrupted();
+        check(ReminderStateLogic.classify(task, located, 250_000L) == ReminderStateLogic.State.NEEDS_RESUME,
+                "interrupted task stays resumable");
+        task.resume();
+        check(task.isActive() && ReminderStateLogic.classify(task,
+                        ReminderRuntime.Snapshot.starting(300_000L), 300_001L) == ReminderStateLogic.State.STARTING,
+                "resumed task starts before monitoring");
+        task.status = AppPrefs.ReminderTask.STATUS_ALERTING;
+        check(ReminderStateLogic.classify(task, ReminderRuntime.Snapshot.stopped(), 300_001L) == ReminderStateLogic.State.ALERTING,
+                "alerting task remains alerting");
+    }
+
     private static void testAmapCoordinateConversion() {
         double wgsLat = 39.908823;
         double wgsLng = 116.397470;
@@ -177,6 +223,17 @@ public final class CoreLogicTest {
         double[] restored = CoordinateTransform.gcj02ToWgs84(gcj[0], gcj[1]);
         check(Math.abs(restored[0] - wgsLat) < 0.00002 && Math.abs(restored[1] - wgsLng) < 0.00002,
                 "amap coordinate conversion");
+    }
+
+    private static void testReminderProviderRegistry() {
+        ReminderProviderRegistry registry = new ReminderProviderRegistry();
+        check(registry.add("gps") && registry.add("network"), "register providers");
+        check(!registry.add("gps") && registry.count() == 2, "duplicate provider is idempotent");
+        check(!registry.remove("passive") && registry.count() == 2, "unknown provider does not decrement");
+        check(registry.remove("gps") && registry.count() == 1, "disable one provider");
+        check(registry.remove("network") && registry.count() == 0, "disable last provider");
+        registry.clear();
+        check(registry.count() == 0, "clear providers");
     }
 
     private static void testRejectsBrokenSystemPlace() {
@@ -196,6 +253,32 @@ public final class CoreLogicTest {
                 "recover truncated system place name");
         check(!PlaceQuality.shouldRecoverQueryName("成都sm广场", "广场", "成都市", "成华区"),
                 "do not recover normal place name");
+    }
+
+    private static void testRepeatedSuggestionStateRendersOnce() {
+        InteractionGate gate = new InteractionGate();
+        int renders = 0;
+        boolean visible = false;
+        for (int i = 0; i < 10_000; i++) {
+            if (gate.shouldRender("message:地图正在智能联想…", visible, true)) {
+                renders++;
+                visible = true;
+            }
+        }
+        check(renders == 1, "repeated suggestion state renders once");
+    }
+
+    private static void testSuggestionGateResets() {
+        InteractionGate gate = new InteractionGate();
+        check(gate.shouldRender("places:a|b|", false, true), "first suggestion render");
+        check(!gate.shouldRender("places:a|b|", true, true), "same suggestion skipped");
+        gate.reset();
+        check(gate.shouldRender("places:a|b|", false, true), "suggestion render after reset");
+    }
+
+    private static void testFastSearchDebounce() {
+        check(InteractionGate.searchDebounceMillis(false) == 120, "default search debounce");
+        check(InteractionGate.searchDebounceMillis(true) == 80, "amap search debounce");
     }
 
     private static Calendar date(TimeZone zone, int year, int month, int day, int hour, int minute) {
