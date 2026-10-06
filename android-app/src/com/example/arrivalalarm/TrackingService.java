@@ -38,6 +38,9 @@ import java.util.List;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 public final class TrackingService extends Service implements LocationListener {
     public static final String ACTION_START_REMINDER = "com.example.arrivalalarm.START_REMINDER";
@@ -75,9 +78,15 @@ public final class TrackingService extends Service implements LocationListener {
     private long lastUsageCheckAt;
     private long lastStationLookupAt;
     private boolean stationLookupInFlight;
+    private final AsyncResultGate stationLookupResults = new AsyncResultGate();
+    private Future<?> stationLookupFuture;
+    private final ExecutorService stationLookupExecutor = Executors.newSingleThreadExecutor();
     private final ReminderProviderRegistry providerRegistry = new ReminderProviderRegistry();
     private long serviceGeneration;
     private boolean acceptingLocationCallbacks;
+    private int locationRecoveryAttempt;
+    private long locationRecoveryStartedElapsedRealtime;
+    private boolean locationRecoveryForcePeriodic;
 
     private final Runnable usageCheck = new Runnable() {
         @Override public void run() {
@@ -104,8 +113,39 @@ public final class TrackingService extends Service implements LocationListener {
             if (!ownsCurrentRuntime()) return;
             AppPrefs.ReminderTask task = prefs.getTask();
             if (task == null || task.isInterrupted()) return;
-            publishRuntime(runtimeSnapshot.heartbeat(SystemClock.elapsedRealtime()));
-            handler.postDelayed(this, REMINDER_HEARTBEAT_INTERVAL_MS);
+            long now = SystemClock.elapsedRealtime();
+            if (runtimeSnapshot.state == ReminderRuntime.State.LOCATION_READY
+                    && runtimeSnapshot.registeredProviderCount > 0
+                    && (runtimeSnapshot.lastLocationElapsedRealtime == 0L
+                    ? !runtimeSnapshot.isWaitingForFirstLocationWithinTimeout(now)
+                    : !runtimeSnapshot.isLocationFresh(now))) {
+                startLocationRecovery(now);
+            } else {
+                publishRuntime(runtimeSnapshot.heartbeat(now));
+            }
+            if (ownsCurrentRuntime() && runtimeSnapshot.state != ReminderRuntime.State.STOPPED
+                    && runtimeSnapshot.state != ReminderRuntime.State.FAILED) {
+                handler.postDelayed(this, REMINDER_HEARTBEAT_INTERVAL_MS);
+            }
+        }
+    };
+
+    private final Runnable locationRecoveryRetry = new Runnable() {
+        @Override public void run() {
+            if (!ownsCurrentRuntime() || runtimeSnapshot.state != ReminderRuntime.State.RECOVERING) return;
+            AppPrefs.ReminderTask task = prefs.getTask();
+            if (task == null || (!task.isActive() && !task.isStarting())) return;
+            if (runtimeSnapshot.lastLocationElapsedRealtime > 0L
+                    && runtimeSnapshot.lastLocationElapsedRealtime >= locationRecoveryStartedElapsedRealtime) {
+                finishLocationRecovery(task);
+                return;
+            }
+            if (LocationRecoveryPolicy.hasAttemptsRemaining(locationRecoveryAttempt)) {
+                attemptLocationRecovery(SystemClock.elapsedRealtime());
+            } else {
+                failReminder(ReminderRuntime.Failure.LOCATION_STALE,
+                        "定位多次自动恢复失败，请检查定位开关或系统省电设置。");
+            }
         }
     };
 
@@ -124,6 +164,7 @@ public final class TrackingService extends Service implements LocationListener {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         serviceGeneration = runtimeGeneration;
+        cancelStationLookup();
         String action = intent == null ? null : intent.getAction();
         if (ACTION_STOP_REMINDER.equals(action)) {
             prefs.clearTask();
@@ -151,6 +192,7 @@ public final class TrackingService extends Service implements LocationListener {
 
     private void startReminderMode(AppPrefs.ReminderTask task) {
         handler.removeCallbacks(usageCheck);
+        resetLocationRecovery();
         journeyDetector = null;
         if (task.isInterrupted()) {
             stopEverything();
@@ -185,7 +227,15 @@ public final class TrackingService extends Service implements LocationListener {
     private void startJourneyMode() {
         if (prefs.getTask() != null) return;
         journeyDetector = prefs.getJourneyDetector();
-        startForeground(FOREGROUND_ID, buildJourneyNotification());
+        try {
+            startForeground(FOREGROUND_ID, buildJourneyNotification());
+        } catch (RuntimeException failed) {
+            prefs.setJourneyEnabled(false);
+            publishRuntime(ReminderRuntime.Snapshot.failed(
+                    ReminderRuntime.Failure.FOREGROUND_START, SystemClock.elapsedRealtime()));
+            stopEverything();
+            return;
+        }
         requestLocationUpdates(false);
         handler.removeCallbacks(usageCheck);
         lastUsageCheckAt = System.currentTimeMillis() - 45_000L;
@@ -197,7 +247,17 @@ public final class TrackingService extends Service implements LocationListener {
     }
 
     private void requestLocationUpdates(boolean precise) {
+        requestLocationUpdates(precise, false, false, false);
+    }
+
+    private void requestLocationUpdates(boolean precise, boolean recovery) {
+        requestLocationUpdates(precise, recovery, recovery, false);
+    }
+
+    private void requestLocationUpdates(boolean precise, boolean recovery,
+                                        boolean forcePeriodic, boolean preserveRuntime) {
         if (!ownsCurrentRuntime()) return;
+        AppPrefs.ReminderTask task = prefs.getTask();
         if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             failReminder(ReminderRuntime.Failure.LOCATION_PERMISSION, "请重新允许精确定位。");
             return;
@@ -206,16 +266,18 @@ public final class TrackingService extends Service implements LocationListener {
             failReminder(ReminderRuntime.Failure.LOCATION_LISTENER, "设备没有可用的定位服务。");
             return;
         }
-        removeLocationUpdates();
-        long minTime = precise ? 5_000L : 60_000L;
-        float minDistance = precise ? 20f : 100f;
+        if (!preserveRuntime) removeLocationUpdates();
+        long minTime = forcePeriodic ? 15_000L : (precise ? 5_000L : 60_000L);
+        float minDistance = forcePeriodic ? 0f : (precise ? 0f : 100f);
         try {
             if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
                 locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, minTime, minDistance, this, Looper.getMainLooper());
                 providerRegistry.add(LocationManager.GPS_PROVIDER);
             }
             if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
-                locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, precise ? 15_000L : minTime, precise ? 50f : minDistance, this, Looper.getMainLooper());
+                long networkMinTime = forcePeriodic ? 15_000L : (precise ? 15_000L : minTime);
+                float networkMinDistance = forcePeriodic ? 0f : (precise ? 0f : minDistance);
+                locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, networkMinTime, networkMinDistance, this, Looper.getMainLooper());
                 providerRegistry.add(LocationManager.NETWORK_PROVIDER);
             }
         } catch (SecurityException ignored) {
@@ -223,7 +285,17 @@ public final class TrackingService extends Service implements LocationListener {
             return;
         } catch (IllegalArgumentException ignored) {
             if (providerRegistry.count() == 0) {
-                failReminder(ReminderRuntime.Failure.LOCATION_LISTENER, "设备暂时无法建立定位监听。");
+                if (task != null && (task.isActive() || task.isStarting())) {
+                    if (!recovery) {
+                        startLocationRecovery(SystemClock.elapsedRealtime());
+                    } else if (LocationRecoveryPolicy.hasAttemptsRemaining(locationRecoveryAttempt)) {
+                        scheduleLocationRecoveryRetry(locationRecoveryAttempt);
+                    } else {
+                        failReminder(ReminderRuntime.Failure.LOCATION_LISTENER, "设备暂时无法建立定位监听。");
+                    }
+                } else {
+                    failReminder(ReminderRuntime.Failure.LOCATION_LISTENER, "设备暂时无法建立定位监听。");
+                }
                 return;
             }
         }
@@ -233,7 +305,71 @@ public final class TrackingService extends Service implements LocationListener {
         }
         long now = SystemClock.elapsedRealtime();
         acceptingLocationCallbacks = true;
-        publishRuntime(ReminderRuntime.Snapshot.locationReady(providerRegistry.count(), now, now, 0L));
+        if (recovery && task != null && task.isActive()) {
+            locationRecoveryForcePeriodic = forcePeriodic;
+            publishRuntime(ReminderRuntime.Snapshot.recovering(
+                    providerRegistry.count(), locationRecoveryAttempt, now, now,
+                    runtimeSnapshot.lastLocationElapsedRealtime));
+            notifications.notify(FOREGROUND_ID, buildRecoveryNotification(task, locationRecoveryAttempt));
+        } else {
+            if (recovery && task != null) {
+                locationRecoveryAttempt = 0;
+                locationRecoveryStartedElapsedRealtime = 0L;
+                handler.removeCallbacks(locationRecoveryRetry);
+                locationRecoveryForcePeriodic = forcePeriodic;
+            } else if (!recovery) {
+                locationRecoveryForcePeriodic = false;
+            }
+            if (task != null) {
+                task.markActive();
+                prefs.saveTask(task);
+            }
+            if (!preserveRuntime) {
+                publishRuntime(ReminderRuntime.Snapshot.locationReady(providerRegistry.count(), now, now, 0L));
+            }
+        }
+    }
+
+    private void startLocationRecovery(long nowElapsedRealtime) {
+        if (runtimeSnapshot.state == ReminderRuntime.State.RECOVERING) return;
+        locationRecoveryAttempt = 0;
+        attemptLocationRecovery(nowElapsedRealtime);
+    }
+
+    private void attemptLocationRecovery(long nowElapsedRealtime) {
+        if (!ownsCurrentRuntime()) return;
+        AppPrefs.ReminderTask task = prefs.getTask();
+        if (task == null || (!task.isActive() && !task.isStarting())) return;
+        locationRecoveryAttempt++;
+        locationRecoveryStartedElapsedRealtime = nowElapsedRealtime;
+        publishRuntime(ReminderRuntime.Snapshot.recovering(
+                providerRegistry.count(), locationRecoveryAttempt, nowElapsedRealtime,
+                nowElapsedRealtime, runtimeSnapshot.lastLocationElapsedRealtime));
+        notifications.notify(FOREGROUND_ID, buildRecoveryNotification(task, locationRecoveryAttempt));
+        requestLocationUpdates(true, true);
+        if (ownsCurrentRuntime() && runtimeSnapshot.state == ReminderRuntime.State.RECOVERING) {
+            scheduleLocationRecoveryRetry(locationRecoveryAttempt);
+        }
+    }
+
+    private void scheduleLocationRecoveryRetry(int attempt) {
+        handler.removeCallbacks(locationRecoveryRetry);
+        handler.postDelayed(locationRecoveryRetry, LocationRecoveryPolicy.delayAfterAttempt(attempt));
+    }
+
+    private void finishLocationRecovery(AppPrefs.ReminderTask task) {
+        locationRecoveryAttempt = 0;
+        locationRecoveryStartedElapsedRealtime = 0L;
+        locationRecoveryForcePeriodic = false;
+        handler.removeCallbacks(locationRecoveryRetry);
+        notifications.notify(FOREGROUND_ID, buildTrackingNotification(task));
+    }
+
+    private void resetLocationRecovery() {
+        locationRecoveryAttempt = 0;
+        locationRecoveryStartedElapsedRealtime = 0L;
+        locationRecoveryForcePeriodic = false;
+        handler.removeCallbacks(locationRecoveryRetry);
     }
 
     @Override
@@ -242,7 +378,15 @@ public final class TrackingService extends Service implements LocationListener {
         AppPrefs.ReminderTask task = prefs.getTask();
         if (task == null || !task.isActive() || providerRegistry.count() == 0) return;
         long nowElapsedRealtime = SystemClock.elapsedRealtime();
+        boolean restoreNormalLocationProfile = false;
+        if (runtimeSnapshot.state == ReminderRuntime.State.RECOVERING) {
+            restoreNormalLocationProfile = locationRecoveryForcePeriodic;
+            finishLocationRecovery(task);
+        }
         publishRuntime(runtimeSnapshot.locationReceived(nowElapsedRealtime));
+        if (restoreNormalLocationProfile) {
+            requestLocationUpdates(true, false, false, true);
+        }
         float accuracy = location.hasAccuracy() ? location.getAccuracy() : Float.MAX_VALUE;
         float speed = location.hasSpeed() ? location.getSpeed() : -1f;
         long timestamp = location.getTime() > 0 ? location.getTime() : System.currentTimeMillis();
@@ -252,7 +396,9 @@ public final class TrackingService extends Service implements LocationListener {
 
     @Override public void onProviderEnabled(String provider) {
         AppPrefs.ReminderTask task = prefs.getTask();
-        if (ownsCurrentRuntime() && task != null && task.isActive()) requestLocationUpdates(true);
+        if (ownsCurrentRuntime() && task != null && task.isActive()) {
+            requestLocationUpdates(true, runtimeSnapshot.state == ReminderRuntime.State.RECOVERING);
+        }
     }
     @Override public void onProviderDisabled(String provider) {
         AppPrefs.ReminderTask task = prefs.getTask();
@@ -260,6 +406,12 @@ public final class TrackingService extends Service implements LocationListener {
         if (!providerRegistry.remove(provider)) return;
         if (providerRegistry.count() == 0) {
             failReminder(ReminderRuntime.Failure.NO_LOCATION_PROVIDER, "请打开定位后再恢复守候。");
+        } else if (runtimeSnapshot.state == ReminderRuntime.State.RECOVERING) {
+            publishRuntime(ReminderRuntime.Snapshot.recovering(
+                    providerRegistry.count(), locationRecoveryAttempt,
+                    locationRecoveryStartedElapsedRealtime,
+                    runtimeSnapshot.lastHeartbeatElapsedRealtime,
+                    runtimeSnapshot.lastLocationElapsedRealtime));
         } else {
             publishRuntime(ReminderRuntime.Snapshot.locationReady(
                     providerRegistry.count(), runtimeSnapshot.stateSinceElapsedRealtime,
@@ -283,7 +435,12 @@ public final class TrackingService extends Service implements LocationListener {
         task.triggeredAt = System.currentTimeMillis();
         prefs.saveTask(task);
         removeLocationUpdates();
-        startForeground(FOREGROUND_ID, buildAlarmNotification(task));
+        try {
+            startForeground(FOREGROUND_ID, buildAlarmNotification(task));
+        } catch (RuntimeException ignored) {
+            // The service is already foreground; retain the alarm notification if the update is rejected.
+            if (notifications != null) notifications.notify(FOREGROUND_ID, buildAlarmNotification(task));
+        }
         publishRuntime(ReminderRuntime.Snapshot.foreground(
                 SystemClock.elapsedRealtime(), SystemClock.elapsedRealtime()));
         startAlarmSound();
@@ -311,7 +468,9 @@ public final class TrackingService extends Service implements LocationListener {
         if (fix.accuracy > 150f || now - lastStationLookupAt < 5L * 60L * 1000L || !prefs.canShowAutoPrompt(now)) return;
         lastStationLookupAt = now;
         stationLookupInFlight = true;
-        new Thread(new Runnable() {
+        final long serviceGenerationAtStart = serviceGeneration;
+        final long lookupToken = stationLookupResults.begin();
+        stationLookupFuture = stationLookupExecutor.submit(new Runnable() {
             @Override public void run() {
                 String station = null;
                 try {
@@ -326,12 +485,19 @@ public final class TrackingService extends Service implements LocationListener {
                             if (station != null) break;
                         }
                     }
-                } catch (IOException | IllegalArgumentException ignored) { }
+                } catch (IOException | IllegalArgumentException | SecurityException ignored) { }
                 final String matchedStation = station;
                 handler.post(new Runnable() {
                     @Override public void run() {
+                        if (!isServiceGenerationCurrent(serviceGenerationAtStart)
+                                || !stationLookupResults.isCurrent(lookupToken)) return;
                         stationLookupInFlight = false;
-                        if (matchedStation == null || prefs.getTask() != null || !prefs.canShowAutoPrompt(System.currentTimeMillis())) return;
+                        stationLookupFuture = null;
+                        if (matchedStation == null
+                                || !prefs.isJourneyEnabled()
+                                || !prefs.isStationWatchEnabled()
+                                || prefs.getTask() != null
+                                || !prefs.canShowAutoPrompt(System.currentTimeMillis())) return;
                         if (journeyDetector != null) {
                             journeyDetector.state = CoreLogic.JourneyDetector.PROMOTED;
                             prefs.setJourneyRuntime(journeyDetector);
@@ -340,7 +506,20 @@ public final class TrackingService extends Service implements LocationListener {
                     }
                 });
             }
-        }, "private-station-check").start();
+        });
+    }
+
+    private void cancelStationLookup() {
+        stationLookupResults.invalidate();
+        stationLookupInFlight = false;
+        if (stationLookupFuture != null) {
+            stationLookupFuture.cancel(true);
+            stationLookupFuture = null;
+        }
+    }
+
+    private boolean isServiceGenerationCurrent(long generation) {
+        return ownsCurrentRuntime() && generation == serviceGeneration;
     }
 
     private void showJourneyPrompt() {
@@ -401,6 +580,23 @@ public final class TrackingService extends Service implements LocationListener {
                 .setColor(Color.rgb(0, 122, 255))
                 .setContentTitle("正在守候 " + task.destination.name)
                 .setContentText(detail)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .setContentIntent(content)
+                .addAction(new Notification.Action.Builder(null, "停止", stop).build())
+                .build();
+    }
+
+    private Notification buildRecoveryNotification(AppPrefs.ReminderTask task, int attempt) {
+        Intent open = new Intent(this, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        PendingIntent content = PendingIntent.getActivity(this, 10, open, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        Intent stopIntent = new Intent(this, ActionReceiver.class).setAction(ActionReceiver.ACTION_STOP_REMINDER);
+        PendingIntent stop = PendingIntent.getBroadcast(this, 11, stopIntent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        return new Notification.Builder(this, CHANNEL_TRACKING)
+                .setSmallIcon(com.example.arrivalalarm.R.drawable.ic_notification)
+                .setColor(Color.rgb(0, 122, 255))
+                .setContentTitle("正在恢复 " + task.destination.name)
+                .setContentText("定位暂时中断，正在自动重试 " + attempt + "/" + LocationRecoveryPolicy.MAX_ATTEMPTS)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
                 .setContentIntent(content)
@@ -477,8 +673,7 @@ public final class TrackingService extends Service implements LocationListener {
         Vibrator vibrator = (Vibrator) getSystemService(VIBRATOR_SERVICE);
         if (vibrator != null && vibrator.hasVibrator()) {
             long[] pattern = new long[]{0, 500, 180, 500, 180, 900};
-            if (Build.VERSION.SDK_INT >= 26) vibrator.vibrate(VibrationEffect.createWaveform(pattern, -1));
-            else vibrator.vibrate(pattern, -1);
+            vibrator.vibrate(VibrationEffect.createWaveform(pattern, -1));
         }
     }
 
@@ -499,7 +694,9 @@ public final class TrackingService extends Service implements LocationListener {
     }
 
     private void stopEverything() {
+        cancelStationLookup();
         handler.removeCallbacks(usageCheck);
+        resetLocationRecovery();
         stopReminderHeartbeat();
         removeLocationUpdates();
         stopAlarmSound();
@@ -524,13 +721,14 @@ public final class TrackingService extends Service implements LocationListener {
                 .putExtra("state_since_elapsed", runtimeSnapshot.stateSinceElapsedRealtime)
                 .putExtra("last_heartbeat_elapsed", runtimeSnapshot.lastHeartbeatElapsedRealtime)
                 .putExtra("last_location_elapsed", runtimeSnapshot.lastLocationElapsedRealtime)
+                .putExtra("recovery_attempt", runtimeSnapshot.recoveryAttempt)
                 .putExtra("failure", runtimeSnapshot.failure.name()), PERMISSION_STATUS);
     }
 
     private void failReminder(ReminderRuntime.Failure failure, String reason) {
         if (!ownsCurrentRuntime()) return;
         AppPrefs.ReminderTask task = prefs.getTask();
-        if (task != null && task.isActive()) {
+        if (task != null && !task.isAlerting()) {
             task.markInterrupted();
             prefs.saveTask(task);
             ReminderRuntimeCoordinator.showRestoreNotification(this, task, reason);
@@ -556,7 +754,10 @@ public final class TrackingService extends Service implements LocationListener {
 
     @Override
     public void onDestroy() {
+        cancelStationLookup();
+        stationLookupExecutor.shutdownNow();
         handler.removeCallbacks(usageCheck);
+        resetLocationRecovery();
         stopReminderHeartbeat();
         removeLocationUpdates();
         stopAlarmSound();
@@ -573,6 +774,7 @@ public final class TrackingService extends Service implements LocationListener {
     }
 
     public static void markStartFailed() {
+        runtimeGeneration++;
         runtimeSnapshot = ReminderRuntime.Snapshot.failed(
                 ReminderRuntime.Failure.FOREGROUND_START, SystemClock.elapsedRealtime());
     }

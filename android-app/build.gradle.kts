@@ -39,6 +39,7 @@ android {
         versionCode = 8
         versionName = "0.4.3"
         buildConfigField("String", "AMAP_WEB_KEY", "\"$amapWebKey\"")
+        testInstrumentationRunner = "com.example.arrivalalarm.LifecycleInstrumentationRunner"
     }
 
     sourceSets {

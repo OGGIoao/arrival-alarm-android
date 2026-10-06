@@ -1,5 +1,32 @@
 # Development Log
 
+## 2026-10-06 — 保存发布加固检查点，暂缓统一设备验收
+
+- 项目负责人授权：先完成已确认问题的源码修复和相关单测/build/lint，再集中进行模拟器及真机回归；设备复现依赖项保留 BLOCKED。
+- 本次将此前未提交的源码、资源、测试和文档一起保存为备份 checkpoint；使用 GitHub 独立分支，不视为可发布版本。
+- P0-1～P0-5 均仍有内部测试、外部材料或设备验收未完成，详细状态已汇总至 RELEASE_READINESS.md；P0-5 自动 instrumentation 仍 BLOCKED。
+- SDK、AVD 和 APK 普通启动已经可用；暂停重复安装和无效 instrumentation 重试。此前未经充分证据的根因判断已在 experiment_log.md 更正。
+
+## 2026-09-21 — P0-3/P0-4/P0-5 生命周期一致性统一修复
+
+### 调查结论
+
+三个问题共享同一类根因，但故障层级不同：P0-3 是持久化任务与服务运行事实不一致；P0-4 是 FGS 启动失败或定位中断后可能假激活、缺失恢复路径；P0-5 是 Activity/Service 已经失效或请求已经被替换后，旧异步结果仍尝试提交。`Future.cancel()` 不能保证结果未排队，因此取消必须和组件所有权、请求代次以及业务状态检查一起使用。
+
+### 统一机制
+
+- 新增 `AsyncResultGate`，用单调递增 token 标记异步请求；新请求或取消操作立即使旧结果失效。
+- `MainActivity` 的地点联想、坐标确认和固定地点解析统一使用结果 gate；`onStop`/`onDestroy` 取消 Future，回调同时检查 Activity 代次、STARTED 状态、`isFinishing`、`isDestroyed` 和结果 token。
+- `TrackingService` 的车站查询使用服务实例代次与结果 gate；命令切换、停止和销毁时取消 Future，旧服务或旧查询不能再显示提示。
+- P0-3/P0-4 保持“持久化 `starting`/`active`/`interrupted` 状态”和“进程内运行快照”分离；只有服务进入前台并成功注册定位 Provider 后才提交 `active`，定位过期先有界重试，重试耗尽或权限/Provider 失败才转为 `interrupted`。
+- 没有引入 AndroidX、第三方生命周期库或 WorkManager，也没有改变首发权限和功能边界。
+
+### 验证
+
+- `android-app/build-apk.ps1 -SdkRoot C:\temp\codex-android-sdk`：PASS；Debug 单测 `84 tests passed`、`LocationRecoveryPolicyTest: PASS`、Lint、编译和 APK 均成功。
+- `android-app/build-release.ps1 -SdkRoot C:\temp\codex-android-sdk`：PASS；Release 单测、Lint、R8、首发权限门禁、AAB 和 Bundletool 验证均成功。当前产物为未签名工程验证 AAB，不得作为正式上传包。
+- 纯 Java 测试和静态构建不能证明真实 Activity 旋转、进程终止、Android 12–16 FGS 限制、厂商省电、权限撤销或通知动作行为；这些路径仍为 `BLOCKED`，需要真机或 instrumentation 验收。
+
 ## 2026-08-30 至 2026-09-01 — P0-3 监控中断恢复与完整复验
 
 ### 初版问题与进度

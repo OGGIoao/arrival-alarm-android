@@ -30,9 +30,7 @@
             android:excludeFromRecents="true"
             android:exported="false"
             android:launchMode="singleTop"
-            android:showWhenLocked="true"
-            android:theme="@style/AlarmTheme"
-            android:turnScreenOn="true" />
+            android:theme="@style/AlarmTheme" />
 
         <activity
             android:name=".MainActivity"
@@ -58,20 +56,6 @@
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="arrivalalarm" android:host="set" />
-            </intent-filter>
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="https" android:host="uri.amap.com" />
-                <data android:scheme="https" android:host="ditu.amap.com" />
-                <data android:scheme="https" android:host="surl.amap.com" />
-                <data android:scheme="https" android:host="map.baidu.com" />
-                <data android:scheme="https" android:host="map.qq.com" />
-                <data android:scheme="https" android:host="www.12306.cn" />
-                <data android:scheme="https" android:host="m.12306.cn" />
-                <data android:scheme="https" android:host="v.didi.cn" />
-                <data android:scheme="https" android:host="page.udache.com" />
             </intent-filter>
         </activity>
 

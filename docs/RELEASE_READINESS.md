@@ -1,10 +1,34 @@
 # Release Readiness Report
 
-- 更新时间：2026-09-01
-- 当前范围：`P0-1 Release 凭据与内部测试`、`P0-2 敏感权限与上架材料`、`P0-3 监控中断与手动恢复`
+- 更新时间：2026-10-06（统一设备验收暂缓；代码修复与设备验收分开记录）
+- 当前范围：`P0-1 Release 凭据与内部测试`、`P0-2 敏感权限与上架材料`、`P0-3 监控中断与手动恢复`、`P0-4 服务启动与假激活`、`P0-5 异步结果与生命周期绑定`
 - 当前结论：`NOT READY`
 
 `NOT READY` 表示应用尚未完成 Play 内部测试、真机验收和 P0-2 外部材料核验，不表示 P0-1 Release 工程仍然缺失。正式上传密钥和远端签名 CI 已有完成证据，但当前产物仍不得直接进入生产发布。
+
+## 2026-09-07 产品目标与当前任务范围
+
+## 2026-10-06 当前检查点与统一验收安排
+
+项目负责人决定：先推进已确认问题的代码修复及必要的单元测试、build、lint，再集中执行模拟器和真机验收。当前暂停 instrumentation 环境排障，不再重复安装工具。必须依赖设备复现才能确定根因的问题保留为 `BLOCKED`，不得猜测修复或提前关闭。
+
+| 问题 | 已有证据 | 未完成 / 后续验收 | 当前状态 |
+|---|---|---|---|
+| P0-1 Release 凭据与内部测试 | 正式密钥备份、恢复演练、受保护签名 CI 与构建检查有历史 PASS 证据 | Play 内部测试及设备冒烟；历史 CI artifact 不保证仍在保留期 | PARTIAL |
+| P0-2 权限与上架材料 | 权限裁剪、Manifest 门禁、披露草稿及历史构建检查 | Console 主体/分类核对、公开材料确认、网络抓包、设备权限验收 | PARTIAL |
+| P0-3 中断与手动恢复 | 状态机、Provider 代次隔离及历史核心测试/build/lint | 进程终止、强制停止、重启、权限撤销、恢复通知、厂商省电 | PARTIAL |
+| P0-4 服务启动与假激活 | starting/active/interrupted 状态与失败回滚、定位恢复策略及历史静态验证 | Android 12–16 FGS 限制与启动失败、后台/锁屏、服务恢复交错 | PARTIAL |
+| P0-5 异步结果与生命周期 | 请求 token/组件代次检查、纯 Java 测试、APK 构建安装及 API 35 普通 Activity 启动 | 旋转/销毁后迟到回调、旧请求覆盖、Service 竞态；当前自定义 instrumentation 未完成 | PARTIAL；自动设备测试 BLOCKED |
+
+上述历史 PASS 不代表本次检查点已重新完成全部测试，也不代表 P0 已全部关闭。统一验收须覆盖各项修复的交互、最低支持版本与当前版本；厂商后台限制仍需真机。整体结论保持 `NOT READY`。
+
+备份范围为当前工作区源码、测试、资源及文档；SDK、AVD、安装包、构建产物、密钥和本地配置不纳入 Git。恢复步骤及工具链现状见 [实验日志](experiment_log.md)。
+
+### 历史产品范围说明
+
+项目负责人确认自动车站提示属于核心目标，首批面向中国大陆常见国产 Android 手机。此前将自动提示视为非核心增强功能的前提已由 ADR-0006 调整；当前代码和以下历史验证记录仍对应手动启动版本。新核心能力尚未实现或验证，整体仍为 `NOT READY`。
+
+按项目负责人要求，P0-1 Play 内部测试、P0-2 上架证据提交和 P0-3 真机验收暂缓。没有 Play Console 不妨碍源码数据流核对、披露整改、自动测试设计及设备方案评估。自动检测所需权限、SDK、数据源、生命周期与商店兼容性需要重新建立证据，详见 [自动车站提示设计](STATION_PROMPT_DESIGN.md)。以下“当前停止点”保留为历史发布流程，恢复任务时优先以本节和新设计为准。
 
 ## 已完成
 
@@ -21,8 +45,8 @@
 
 ### 质量和可复现性
 
-- 核心 Java 测试套件已通过，并已接入 Gradle/JUnit；当前共 `55 tests passed`，包含提醒状态机、Provider 生命周期和地点联想交互门禁。
-- `lintDebug` 与 `lintRelease` 已通过，阻断错误为 0；当前 Release 仍有 35 条非阻断警告，尚未逐项处理。
+- 核心 Java 测试套件已通过，并已接入 Gradle/JUnit；2026-09-21 复验为 `84 tests passed`，另有 `LocationRecoveryPolicyTest: PASS`，包含提醒状态机、Provider 生命周期、异步结果代次和地点联想交互门禁。
+- `lintDebug` 与 `lintRelease` 已通过，阻断错误为 0；Release 警告经 2026-09-17 重新生成后从 35 条降至 5 条，处置明细见 [Lint 处置记录](LINT_DISPOSITION.md)。
 - 已生成 `gradle.lockfile` 和依赖 SHA-256 校验元数据。
 - Gradle 发行包配置了官方 SHA-256 校验值。
 - 已针对中文 Windows 用户目录设置独立 ASCII Gradle 缓存和构建输出路径。
@@ -47,8 +71,26 @@
 - `TrackingService` 使用 `START_NOT_STICKY`，不在重启或进程终止后静默恢复；恢复只能由可见 Activity 或用户点击恢复通知触发。
 - Provider 以名称集合维护，运行代次隔离旧服务的延迟销毁、心跳和定位回调；恢复复用幂等启动动作，避免异步停止再启动竞态。
 - 内部状态广播由按变体 Application ID 派生的 `signature` 权限保护；API 33+ 同时使用 `RECEIVER_NOT_EXPORTED`。
-- 2026-09-01 重装固定 Build Tools `36.0.0` 后，Debug 与 Release 全链均 `PASS`：55 个核心测试、两种 Lint、R8、权限门禁、Debug APK、Release AAB 和 Bundletool 均通过。
+- 2026-09-21 复验：Debug 与 Release 全链均 `PASS`；84 个核心测试、两种 Lint、R8、权限门禁、Debug APK、Release AAB 和 Bundletool 均通过。
 - 当前没有连接设备、有效系统镜像或 AVD；强制停止、系统重启、厂商省电、权限撤销、FGS 限制和恢复通知仍需最低与当前 Android 真机验收。
+
+### P0-4 服务启动与假激活
+
+- 当前状态：`PARTIAL`。代码、状态机测试、Debug/Release 构建和静态验证已通过；Android 12–16 FGS 启动限制与真实启动失败路径仍为 `BLOCKED`。
+- 任务先持久化为 `starting`，只有 `TrackingService` 成功进入前台并注册至少一个定位 Provider 后才提交 `active`；`startForegroundService()` 同步异常、前台化失败、启动超时和 Provider 初始化失败统一转为 `interrupted` 并显示恢复通知。
+- 服务存活期间定位过期先进入 `RECOVERING`，以 10 秒、30 秒退避最多重注册两次；收到新定位后恢复监控，权限/Provider 关闭或重试耗尽才要求用户手动恢复。
+- 通知动作和固定入口复用 `ReminderRuntimeCoordinator`，不再用普通 `startService()` 绕过 FGS 启动契约；启动失败不会留下“active 但实际未运行”的任务。
+
+### P0-5 异步结果与生命周期绑定
+
+- 当前状态：`PARTIAL`。代码、纯 Java 代次测试、Debug/Release 构建和静态验证已通过；Activity 旋转/销毁后的真实回调、进程回收和 Service 命令竞态仍需 instrumentation 或真机验收。
+- `AsyncResultGate` 为页面任务和服务查询提供统一请求 token；`Future.cancel()` 后仍到达的回调必须再次通过组件代次、生命周期和 token 检查才能提交。
+- `MainActivity` 的处理覆盖地点联想、坐标确认和固定地点解析；`TrackingService` 的处理覆盖车站反查。取消、替换请求和组件销毁都会使旧结果失效。
+- 自动验证复验与缺口矩阵见 [`docs/experiment_log.md`](experiment_log.md)。此前用户提及的真机工作目前缺少设备、产物和日志绑定信息，暂记为 `UNKNOWN`，不作为 P0-5 PASS 证据。
+- 2026-10-05 已建立可用的 API 35 AVD `arrival-api35-clean`；Debug APK 安装、主 Activity 启动、force-stop 后重启冒烟通过。Activity 旋转和迟到回调仍未运行 instrumentation，P0-5 继续为 `PARTIAL`。
+- 2026-10-05 instrumentation 重试未形成 PASS：首次因 AVD 中旧 APK 签名不一致而被拒装，卸载后重试又卡在模拟器控制台/启动链；已更换为独立的 `arrival-api35-validation2` AVD，仍未进入 `adb device`。详见 [`docs/experiment_log.md`](experiment_log.md)，P0-5 继续为 `PARTIAL / BLOCKED`。
+- 2026-10-05 清理后使用 `ARRIVAL_BUILD_DIR=C:\\temp\\arrival-build-p05-rebuild` 重建，Debug 单元测试、Java 编译和 `assembleDebug` 均 `PASS`；这只证明构建路径问题已绕开，不替代 instrumentation 运行时证据。
+- 2026-10-06 已用管理员 ADB 35.0.2 启动 API 35 AVD，APK 安装和 `MainActivity` 的直接 `am start -W` 均 `PASS`；`am instrument` 自定义 Runner 不返回，instrumentation 仍为 `BLOCKED`，P0-5 不关闭。
 
 ### 签名流程验证
 
@@ -99,14 +141,15 @@
 - [ ] 推送更新后的公开隐私政策，确认应用内 GitHub HTTPS 链接无需登录即可访问最新内容。
 - [ ] 对 Release 地点查询进行抓包，确认 Photon、高德和系统 `Geocoder` 实际发送的域名、搜索关键词和坐标字段，再完成 Data Safety。
 - [ ] 在最低支持版本及当前 Android 版本真机验证权限拒绝、主动启动、锁屏/后台守候、到站响铃通知、停止任务和旧版本升级路径。
-- [ ] 在最低支持版本及当前 Android 版本真机验证 P0-3：启动提醒后强制停止/终止进程、重启设备、打开应用出现“需要恢复”、点击一次恢复后前台服务和定位监听重新建立，并验证权限被撤销与 Provider 关闭路径。
-- [ ] 评估并处理 35 条非阻断 Release Lint 结果；若决定延期，需要逐项记录风险接受理由。
+- [ ] 在最低支持版本及当前 Android 版本真机验证 P0-3/P0-4/P0-5：启动提醒后强制停止/终止进程、重启设备、打开应用出现“需要恢复”、点击一次恢复后前台服务和定位监听重新建立；在 FGS 启动限制、权限撤销、Provider 关闭、Activity 旋转/退出和迟到查询各路径上确认不会假显示监控或回写旧结果。
+- [x] 已重新生成 Release Lint 报告，35 条警告已逐条分类与处置，降至 5 条并记录理由，见 [Lint 处置记录](LINT_DISPOSITION.md)。
+- [x] 已删除第三方网站链接入口（9 个 `https` 域名 + `BROWSABLE`）。`autoVerify` 只对自有域名有效，该入口无法实现“点击链接直接启动本应用”，只会在系统“打开方式”里出现，同时扩大导出面。目的地导入统一走系统分享、`PROCESS_TEXT`、`arrivalalarm://set` 深链和粘贴。
 
 ## 当前停止点
 
 P0-1 的 Release 工程、正式凭据、独立备份、恢复演练、受保护 GitHub Secrets 和远端签名 CI 已完成，技术状态为 `READY FOR INTERNAL TEST`。
 
-下一步不是重新生成 AAB，也不是直接生产发布，而是：确认离线主密码恢复记录已经单独存放，然后在 Google Play Console 创建应用、启用 Play App Signing，并仅把受控签名流程生成的产物用于内部测试轨道。P0-2 仍需核对 Play Console 名称、公开链接、Data Safety、抓包和真机证据；P0-3 仍需最低与当前 Android 真机生命周期验收，因此整体 Release Readiness 继续为 `NOT READY`。
+下一步不是重新生成 AAB，也不是直接生产发布，而是：确认离线主密码恢复记录已经单独存放，然后在 Google Play Console 创建应用、启用 Play App Signing，并仅把受控签名流程生成的产物用于内部测试轨道。P0-2 仍需核对 Play Console 名称、公开链接、Data Safety、抓包和真机证据；P0-3/P0-4/P0-5 仍缺最低与当前 Android 真机/ instrumentation 生命周期验收，因此整体 Release Readiness 继续为 `NOT READY`。
 
 ## 2026-08-30：Play 发布准备补充
 

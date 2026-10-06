@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">别坐过站</string>
+    <string name="meta_awaiting_first_fix">定位监听已建立，等待首个定位 · %1$s 时提醒</string>
+    <string name="meta_distance_remaining">距离约 %1$s · %2$s 时提醒</string>
+    <string name="meta_waiting_location">等待定位 · %1$s 时提醒</string>
+    <string name="radius_label">提醒距离  ·  %1$s</string>
 </resources>

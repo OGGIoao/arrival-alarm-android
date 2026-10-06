@@ -78,7 +78,7 @@
 
 ## ADR-0004：首个 Play 版本采用用户主动启动的最小权限提醒
 
-- Status: Accepted
+- Status: Superseded in product scope by ADR-0006; retained as current implementation baseline
 - Recorded: 2026-08-27
 
 ### Context
@@ -149,6 +149,153 @@ Android 设备重启、系统终止进程或厂商省电策略都可能使 `Trac
 - 2026-09-01 重装固定的 Build Tools `36.0.0` 后，Debug 全链与 Release 全链均通过：55 个核心测试、Debug/Release Lint、R8、权限门禁、APK/AAB 和 Bundletool 均有完成证据。
 - 内部状态广播使用按 Application ID 派生的 `signature` 权限；API 33+ 额外使用 `RECEIVER_NOT_EXPORTED`，避免外部伪造状态刷新并允许不同签名的 Debug/Release 并存。
 - 当前仍无真机或有效 AVD；真实进程终止、重启、厂商省电、FGS 限制、权限撤销和恢复通知路径仍需设备验证。
+
+## ADR-0006：自动车站提示属于核心目标，优先面向国产 Android
+
+- Status: Accepted for product direction; implementation architecture pending
+- Recorded: 2026-09-07
+- Supersedes: ADR-0004 中将自动车站提示视为非核心增强功能的产品前提
+
+### Context
+
+项目负责人明确，用户忘记设置提醒正是产品要解决的问题：接近地铁站或高铁站时收到设置提示，点击后选择目的地并主动开始守候。首批用户使用中国大陆常见国产 Android 手机。此前仅以自动提示非核心为由维持手动启动范围，已经不符合该产品目标。
+
+### Decision
+
+将自动车站提示纳入核心目标重新设计，现有代码作为可回滚的手动启动基线。Google Play 服务不能作为首批设备的必备依赖；国内定位或地理围栏 SDK 仅为候选，尚未选型或引入。
+
+项目负责人接受开启自动提示后显示“车站提示已开启，可随时暂停”一类持续运行通知。用户明确开启后默认全天运行，并可选择暂停、关闭或设置运行时间段。该选择仅确定用户体验边界，不代表后台执行、耗电或权限审核已通过。
+
+产品必要性、系统允许执行和商店允许发布分别需要证据。用户将功能定义为核心，不等于系统会授予权限或商店会批准用途。只增加披露文案不能完成本次目标。
+
+继续暂缓真机操作、Play 内部测试和商店材料提交。恢复旧服务、增加权限或 SDK、选择商店、提交审核都不是本次文档变更的内容。ADR-0005 的现有到站任务恢复行为仍作为实现基线；自动提示在重启或进程终止后的恢复方式需要单独设计。
+
+### Consequences
+
+- P0-2 的原最小权限证据仍对应现有构建，不能用于宣称自动车站提示已经验证。
+- P0-3 需要分别考虑自动检测和用户已确认的到站任务，不能用同一个 active 状态代表两者运行正常。
+- 车站数据授权、目标机型、SDK 数据处理、耗电、重复提示和重启恢复仍为待决项，不填入未经确认的默认阈值。
+- 旧 Geocoder 地址名称匹配并非可靠的车站进入检测，不能作为恢复功能的完成标准。
+
+### Verification
+
+产品流程、已知证据、候选方案、待决项和可在无 Console 环境推进的验收工作见 [自动车站提示设计](STATION_PROMPT_DESIGN.md)。具体 SDK、权限和后台架构确定后另行记录实施决策；本条不宣称运行时或上架验收通过。
+
+## ADR-0007：提醒任务启动必须经过持久化握手
+
+- Status: Accepted
+- Recorded: 2026-09-09
+- Supersedes: ADR-0005 中关于任务状态与服务运行态分离的实现约束
+
+### Context
+
+`startForegroundService()` 成功返回只代表启动请求已提交，不能证明服务已经进入前台，更不能证明定位监听已经建立。此前提醒任务在启动服务前就保存为 `active`，因此 Android 12+ 后台启动限制、Android 14+ location 前台服务限制、权限变化或定位 Provider 初始化失败时，磁盘上的任务可能仍显示为正在守候。
+
+### Decision
+
+提醒任务增加持久化的 `starting` 状态。创建或恢复任务时先保存为 `starting`；`TrackingService` 成功调用 `startForeground()` 并注册至少一个定位 Provider 后，才将任务提交为 `active`。服务启动调用、前台化或定位监听建立失败，以及启动握手超时，统一将任务转为 `interrupted`，发送带“恢复”动作的通知，并保留用户手动恢复入口。
+
+所有提醒启动入口复用 `ReminderRuntimeCoordinator` 的异常处理；通知操作与固定闹钟入口不再各自维护启动失败逻辑。自动车站提示的前台服务启动也捕获同步异常并回滚开关状态。运行态仍由进程内 `ReminderRuntime.Snapshot` 表达，不能用持久化状态替代服务事实。
+
+### Alternatives
+
+- 继续在请求提交后保存 `active`：无法区分请求成功与服务实际可用，拒绝。
+- 只依赖进程内运行快照：进程终止后无法向用户留下可恢复的持久事实，拒绝。
+- 在进程死亡后后台反复自行拉起整个 FGS 或使用开机恢复：超出当前首发后台策略，且会重新引入 Android 版本和厂商限制，拒绝。服务仍存活时的定位监听重注册不属于这一层，必须有次数和退避上限。
+
+### Consequences
+
+- UI 和持久化数据不会在服务建立前声称监控已经 active。
+- 启动中进程被杀或超时后，任务会显示为需要恢复，用户可以从应用或通知重新启动。
+- 真机仍需验证 Android 12-16 的 FGS 限制、通知动作、定位权限和精确闹钟场景；本机当前缺少 Android SDK，自动构建尚未执行。
+
+### Verification
+
+- 纯 Java 状态测试覆盖 `starting`、无服务恢复、定位监听建立后转 `active` 和失败恢复。
+- Android 构建、Lint、通知动作、精确闹钟和 Android 12-16 真机/模拟器验证待 SDK 与设备环境具备后执行。
+
+### Follow-up hardening
+
+服务存活和业务监控有效不是同一个事实。即使服务心跳仍在更新，定位 Provider 也可能长期不再提供新位置。因此 `ReminderRuntime` 使用 5 分钟的定位新鲜度窗口；精确提醒的同时使用零距离过滤，使静止设备仍按时间收到定位，不以“位置没有变化”冒充挂机。服务心跳在后台主动检查该窗口，超过后先进入 `RECOVERING`，以 10 秒和 30 秒退避重新注册 Provider，最多尝试两次。恢复探针同样使用零距离过滤；权限被撤销、全部 Provider 被关闭、服务启动限制或重试耗尽时才转为 `interrupted` 并发送恢复通知。状态判断始终拒绝把 `RECOVERING` 或过期定位显示为 `MONITORING`。5 分钟是当前定位间隔、弱信号和系统批处理之间的工程折中，后续应通过目标设备测试重新校准。
+
+## ADR-0008：导入坐标必须按来源转换坐标系
+
+- Status: Accepted
+- Recorded: 2026-09-17
+
+### Context
+
+目的地可以从地图链接、系统分享或粘贴文本导入，解析出的经纬度会直接进入距离计算，不再经过名称搜索。中国大陆的第三方地图使用的坐标系与设备定位不同：高德和腾讯使用 GCJ-02，百度使用 BD-09，而设备 GNSS 与系统 `Location` 使用 WGS-84。在成都，两套坐标系之间的偏移可达数百米。
+
+此前的实现只对高德搜索结果做了 GCJ-02 到 WGS-84 的转换，导入路径完全不做转换。结果是本该“最准”的坐标直用路径反而系统性地偏移数百米，而且偏移量无法从确认框里的地址文本直接看出来。
+
+### Decision
+
+坐标转换统一放在解析边界完成，让 `confirmCoordinateDestination` 之后拿到的坐标一律是 WGS-84：
+
+- 文本或链接包含 `amap.com`、`amapuri://`、`androidamap://`、`map.qq.com`、`qqmap://` 时按 GCJ-02 转换成 WGS-84。
+- 文本或链接包含 `baidu.com`、`baidumap://` 时按 BD-09 转换成 WGS-84。
+- `arrivalalarm://set` 由本应用定义，坐标一律视为 WGS-84，不做转换。
+- 来源无法识别时不转换，并在目的地确认框里明确标注“坐标系未能识别、按原值使用”，由用户核对地址。
+
+转换全部在本地完成，不引入地图 SDK、在线坐标转换服务或新的数据接收方。
+
+### Alternatives
+
+- 一律按 GCJ-02 转换：会把 Google Maps 等本来就是 WGS-84 的链接改错，拒绝。
+- 一律不转换、仅在界面提示：偏移达数百米，用户无法从地址文本判断，等于把错误留给用户，拒绝。
+- 调用第三方坐标转换 API：引入新的数据接收方、网络依赖和隐私披露，拒绝。
+
+### Consequences
+
+- 从高德、百度、腾讯导入的目的地与设备定位处于同一坐标系，提醒半径不会被系统性偏移吃掉。
+- 来源无法识别的坐标仍然保留原值，但界面会明确说明，不会静默当作 WGS-84。
+- 12306 与滴滴的分享文本没有携带坐标的样本证据；若将来确认它们会带坐标，需要单独核验坐标系并补充映射。
+- 目的地反查地址使用的是转换后的 WGS-84 坐标，反查结果比转换前更可信。
+
+### Verification
+
+- 纯 Java 测试覆盖：高德链接 GCJ-02 往返、腾讯链接 GCJ-02 往返、百度链接 BD-09 转换偏移、`bd09ToGcj02` 往返、以及未知来源保持原值。
+- `gradlew clean testDebugUnitTest lintRelease bundleRelease validateReleaseBundle --no-build-cache --no-daemon`：`BUILD SUCCESSFUL`，Lint 阻断错误 0 个。
+
+## ADR-0009：异步结果必须同时校验组件所有权和请求代次
+
+- Status: Accepted
+- Recorded: 2026-09-21
+
+### Context
+
+P0-5 的旧 Activity 回调、P0-3 的旧服务回调和 P0-4 的启动失败回滚属于同一类一致性问题：任务发出后，接收结果的对象或业务状态可能已经失效。`Future.cancel()` 只能尽力取消，不能阻止已经运行或已经排队的回调继续提交结果；仅调用 `isDestroyed()` 也不能区分同一页面上的旧请求与新请求。
+
+### Decision
+
+在不引入 AndroidX、`ViewModel`、协程或 WorkManager 的前提下，使用同一套所有权和请求代次语义：
+
+- `AsyncResultGate` 为每次异步请求生成单调递增 token；新请求或取消操作会使旧 token 失效，结果提交前必须再次确认 token 仍当前。
+- `MainActivity` 的联想、坐标确认和固定地点解析都使用结果 gate；`onStop`/`onDestroy` 取消失效 Future，并把 Activity 代次、STARTED 状态、`isFinishing` 和 `isDestroyed` 与 gate 一起检查后才能更新 UI 或显示 Dialog。
+- `TrackingService` 的独立异步查询同时检查服务实例代次和结果 gate；命令切换、停止和销毁都会取消查询并使旧结果失效。
+- P0-3/P0-4 继续使用“持久化任务状态 + 进程内运行快照 + 服务确认握手 + 有界恢复”，结果 gate 只补充异步提交边界，不替代提醒状态机。
+
+只有当前页面或当前服务实例、当前请求三者都有效时，结果才可以提交。
+
+### Alternatives
+
+- 引入 AndroidX `Lifecycle`/`ViewModel` 和协程：能获得官方生命周期支持，但会改变当前无 AndroidX 的单模块架构并扩大依赖、迁移和测试范围；当前短时查询可以先用等价的手工 gate，拒绝本次引入。
+- 只调用 `Future.cancel()`：无法覆盖已经进入主线程队列的结果，拒绝。
+- 只在显示 Dialog 前检查 `isDestroyed()`：无法处理同页面上的旧搜索结果覆盖新操作，拒绝。
+- 把所有查询升级为 WorkManager：这些查询只服务于当前页面或当前服务会话，持久化会扩大语义和生命周期，拒绝。
+
+### Consequences
+
+- 旧 Activity、旧服务实例和旧请求都不能再提交 UI 或业务结果。
+- 取消、代次失效和生命周期检查成为必须同时维护的约束；没有编译器强制，新增异步入口必须复用 gate 并增加回归测试。
+- 仍无法保证底层网络或系统 `Geocoder` 立即停止，只能保证其迟到结果不具备提交资格。
+
+### Verification
+
+- `AsyncResultGate` 的当前、替换和取消语义有纯 Java 回归测试。
+- Activity 和 Service 的结果回调同时检查组件代次与请求 token。
+- `build-apk.ps1` 与 `build-release.ps1` 已通过测试、Debug/Release Lint、R8、权限门禁和 Bundle 校验；真实 Activity 旋转、进程终止和厂商后台限制仍需真机或 instrumentation 验收。
 
 ## 新决策模板
 

@@ -217,6 +217,7 @@ public final class AppPrefs {
     }
 
     public static final class ReminderTask {
+        public static final String STATUS_STARTING = "starting";
         public static final String STATUS_ACTIVE = "active";
         public static final String STATUS_ALERTING = "alerting";
         public static final String STATUS_INTERRUPTED = "interrupted";
@@ -239,13 +240,17 @@ public final class AppPrefs {
         }
 
         public boolean isActive() { return STATUS_ACTIVE.equals(status); }
+        public boolean isStarting() { return STATUS_STARTING.equals(status); }
         public boolean isAlerting() { return STATUS_ALERTING.equals(status); }
         public boolean isInterrupted() { return STATUS_INTERRUPTED.equals(status); }
         public void markInterrupted() {
-            if (isActive()) status = STATUS_INTERRUPTED;
+            if (isStarting() || isActive()) status = STATUS_INTERRUPTED;
         }
         public void resume() {
-            status = STATUS_ACTIVE;
+            status = STATUS_STARTING;
+        }
+        public void markActive() {
+            if (isStarting()) status = STATUS_ACTIVE;
         }
 
         JSONObject toJson() {

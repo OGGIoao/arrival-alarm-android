@@ -102,9 +102,15 @@ public final class MainActivity extends Activity {
             runtimeHandler.postDelayed(this, 10_000L);
         }
     };
-    private int suggestionGeneration;
+    private long activityGeneration;
+    private boolean activityStarted;
     private Runnable suggestionDebounce;
     private Future<?> suggestionFuture;
+    private Future<?> coordinateFuture;
+    private Future<?> fixedPlaceFuture;
+    private final AsyncResultGate suggestionResults = new AsyncResultGate();
+    private final AsyncResultGate coordinateResults = new AsyncResultGate();
+    private final AsyncResultGate fixedPlaceResults = new AsyncResultGate();
     private final InteractionGate suggestionRenderGate = new InteractionGate();
     private final InteractionGate recentsRenderGate = new InteractionGate();
     private List<AppPrefs.Destination> localSuggestionCandidates = Collections.emptyList();
@@ -116,6 +122,8 @@ public final class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        activityStarted = true;
+        activityGeneration = 1L;
         prefs = new AppPrefs(this);
         disableDeferredAutomation();
         ReminderRuntimeCoordinator.ensureRestoreNotificationChannel(this);
@@ -123,12 +131,8 @@ public final class MainActivity extends Activity {
         configurePalette();
         getWindow().setStatusBarColor(PAPER);
         getWindow().setNavigationBarColor(PAPER);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
-        }
-        if (Build.VERSION.SDK_INT >= 26) {
-            getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
-        }
+        getWindow().getDecorView().setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
         buildUi();
         handleIntent(getIntent());
     }
@@ -150,6 +154,10 @@ public final class MainActivity extends Activity {
     @Override
     protected void onStart() {
         super.onStart();
+        if (!activityStarted) {
+            activityStarted = true;
+            activityGeneration++;
+        }
         runtimeSnapshot = TrackingService.getRuntimeSnapshot();
         statusReceiver = new BroadcastReceiver() {
             @Override public void onReceive(Context context, Intent intent) {
@@ -160,6 +168,7 @@ public final class MainActivity extends Activity {
         IntentFilter filter = new IntentFilter(TrackingService.ACTION_STATUS);
         registerStatusReceiver(filter);
         refreshUi();
+        if (destinationInput != null) destinationInput.setEnabled(true);
         runtimeHandler.post(runtimeRefresh);
     }
 
@@ -176,6 +185,9 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onStop() {
+        activityStarted = false;
+        activityGeneration++;
+        cancelActivityAsyncWork();
         super.onStop();
         runtimeHandler.removeCallbacks(runtimeRefresh);
         if (statusReceiver != null) unregisterReceiver(statusReceiver);
@@ -184,10 +196,34 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        if (suggestionDebounce != null && destinationInput != null) destinationInput.removeCallbacks(suggestionDebounce);
-        if (suggestionFuture != null) suggestionFuture.cancel(true);
+        activityStarted = false;
+        activityGeneration++;
+        cancelActivityAsyncWork();
         placeSearchExecutor.shutdownNow();
         super.onDestroy();
+    }
+
+    private void cancelActivityAsyncWork() {
+        suggestionResults.invalidate();
+        coordinateResults.invalidate();
+        fixedPlaceResults.invalidate();
+        if (suggestionDebounce != null && destinationInput != null) destinationInput.removeCallbacks(suggestionDebounce);
+        if (suggestionFuture != null) suggestionFuture.cancel(true);
+        if (coordinateFuture != null) coordinateFuture.cancel(true);
+        if (fixedPlaceFuture != null) fixedPlaceFuture.cancel(true);
+        suggestionDebounce = null;
+        suggestionFuture = null;
+        coordinateFuture = null;
+        fixedPlaceFuture = null;
+    }
+
+    private boolean isActivityCallbackValid(long generation) {
+        return activityStarted && generation == activityGeneration
+                && !isFinishing() && !isDestroyed();
+    }
+
+    private boolean isActivityCallbackValid(long activityToken, long resultToken, AsyncResultGate results) {
+        return isActivityCallbackValid(activityToken) && results.isCurrent(resultToken);
     }
 
     private void buildUi() {
@@ -341,7 +377,7 @@ public final class MainActivity extends Activity {
     private void searchDestination() {
         final String query = destinationInput.getText().toString().trim();
         if (query.isEmpty()) { destinationInput.requestFocus(); return; }
-        suggestionGeneration++;
+        final long resultToken = suggestionResults.begin();
         if (suggestionDebounce != null) destinationInput.removeCallbacks(suggestionDebounce);
         if (suggestionFuture != null) suggestionFuture.cancel(true);
         hideKeyboard();
@@ -355,11 +391,13 @@ public final class MainActivity extends Activity {
             return;
         }
         renderSuggestionMessage(!developerAmapKey().isEmpty() ? "高德正在确认地点…" : "地图正在确认地点…");
+        final long activityToken = activityGeneration;
         suggestionFuture = placeSearchExecutor.submit(new Runnable() {
             @Override public void run() {
                 final List<AppPrefs.Destination> results = queryPlaces(query, 7);
                 runOnUiThread(new Runnable() {
                     @Override public void run() {
+                        if (!isActivityCallbackValid(activityToken, resultToken, suggestionResults)) return;
                         if (!query.equals(destinationInput.getText().toString().trim())) return;
                         if (results.isEmpty()) {
                             renderSuggestionMessage("没有找到可靠地点，请换个关键词");
@@ -479,7 +517,8 @@ public final class MainActivity extends Activity {
 
     private void updatePlaceSuggestions(String raw) {
         final String query = raw.trim();
-        final int generation = ++suggestionGeneration;
+        final long resultToken = suggestionResults.begin();
+        final long activityToken = activityGeneration;
         if (suggestionDebounce != null) destinationInput.removeCallbacks(suggestionDebounce);
         if (suggestionFuture != null) suggestionFuture.cancel(true);
         if (suggestionsList == null || query.isEmpty()) {
@@ -508,13 +547,14 @@ public final class MainActivity extends Activity {
         if (local.isEmpty()) renderSuggestionMessage(amapEnabled ? "高德正在智能联想…" : "地图正在智能联想…");
         suggestionDebounce = new Runnable() {
             @Override public void run() {
-                if (generation != suggestionGeneration) return;
+                if (!isActivityCallbackValid(activityToken, resultToken, suggestionResults)) return;
                 suggestionFuture = placeSearchExecutor.submit(new Runnable() {
                     @Override public void run() {
                         final List<AppPrefs.Destination> remote = queryPlaces(query, 4);
                         runOnUiThread(new Runnable() {
                             @Override public void run() {
-                                if (generation != suggestionGeneration || !query.equals(destinationInput.getText().toString().trim())) return;
+                                if (!isActivityCallbackValid(activityToken, resultToken, suggestionResults)
+                                        || !query.equals(destinationInput.getText().toString().trim())) return;
                                 suggestionCache.put(cacheKey, new ArrayList<>(remote));
                                 List<AppPrefs.Destination> merged = mergePlaces(localPlaceSuggestions(query), remote, 4);
                                 if (merged.isEmpty()) renderSuggestionMessage("暂未找到，试试“城市 + 地点名”");
@@ -593,7 +633,7 @@ public final class MainActivity extends Activity {
             item.addView(select, new LinearLayout.LayoutParams(dp(48), dp(44)));
             item.setOnClickListener(view -> {
                 view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
-                suggestionGeneration++;
+                suggestionResults.invalidate();
                 suggestionRenderGate.reset();
                 destinationInput.setText("");
                 suggestionsList.setVisibility(View.GONE);
@@ -650,7 +690,7 @@ public final class MainActivity extends Activity {
     private void startPendingDestination() {
         if (pendingDestination == null) return;
         long now = System.currentTimeMillis();
-        AppPrefs.ReminderTask task = new AppPrefs.ReminderTask("task-" + now, pendingDestination, prefs.getRadius(), AppPrefs.ReminderTask.STATUS_ACTIVE, now);
+        AppPrefs.ReminderTask task = new AppPrefs.ReminderTask("task-" + now, pendingDestination, prefs.getRadius(), AppPrefs.ReminderTask.STATUS_STARTING, now);
         prefs.saveTask(task);
         prefs.addRecent(pendingDestination);
         boolean started = ReminderRuntimeCoordinator.startReminder(this);
@@ -750,14 +790,6 @@ public final class MainActivity extends Activity {
         if (intent == null) return;
         ShareParser.ParsedShare shared = ShareParser.fromIntent(intent);
         if (shared == null) {
-            if (ShareParser.isTravelWebsite(intent)) {
-                destinationInput.requestFocus();
-                destinationInput.postDelayed(new Runnable() {
-                    @Override public void run() { showKeyboard(); }
-                }, 250);
-                toast("检测到出行网站，请输入或分享目的地");
-                return;
-            }
             if (Intent.ACTION_SEND.equals(intent.getAction())) toast("未能识别分享链接，请直接输入地点名称");
             return;
         }
@@ -775,7 +807,10 @@ public final class MainActivity extends Activity {
         final double latitude = parsed.latitude;
         final double longitude = parsed.longitude;
         destinationInput.setEnabled(false);
-        new Thread(new Runnable() {
+        final long activityToken = activityGeneration;
+        final long resultToken = coordinateResults.begin();
+        if (coordinateFuture != null) coordinateFuture.cancel(true);
+        coordinateFuture = placeSearchExecutor.submit(new Runnable() {
             @Override public void run() {
                 String foundAddress = "";
                 if (Geocoder.isPresent()) {
@@ -790,10 +825,14 @@ public final class MainActivity extends Activity {
                 final String address = foundAddress;
                 runOnUiThread(new Runnable() {
                     @Override public void run() {
+                        if (!isActivityCallbackValid(activityToken, resultToken, coordinateResults)) return;
                         destinationInput.setEnabled(true);
                         String coordinate = String.format(Locale.CHINA, "%.6f, %.6f", latitude, longitude);
                         String verification = address.isEmpty() ? "系统无法反查地址，请确认地点名称和坐标。" : "系统反查：" + address;
-                        String message = name + "\n" + verification + "\n来源：" + parsed.source + "\n坐标：" + coordinate;
+                        String coordinateSystem = parsed.coordinateSystemVerified
+                                ? "坐标系：已按来源转换到 WGS-84"
+                                : "坐标系：未能识别来源，已按原值使用，请核对下面的地址";
+                        String message = name + "\n" + verification + "\n来源：" + parsed.source + "\n" + coordinateSystem + "\n坐标：" + coordinate;
                         showStyledDialog(new AlertDialog.Builder(MainActivity.this).setTitle("核对目的地")
                                 .setMessage(message)
                                 .setNegativeButton("取消", null)
@@ -804,7 +843,7 @@ public final class MainActivity extends Activity {
                     }
                 });
             }
-        }, "private-coordinate-check").start();
+        });
     }
 
     private void showJourneyOptIn() {
@@ -828,7 +867,13 @@ public final class MainActivity extends Activity {
     private void enableJourneyService() {
         prefs.setJourneyEnabled(true);
         Intent service = new Intent(this, TrackingService.class).setAction(TrackingService.ACTION_ENABLE_JOURNEY);
-        startForegroundService(service);
+        try {
+            startForegroundService(service);
+        } catch (RuntimeException blocked) {
+            prefs.setJourneyEnabled(false);
+            toast("乘车提示启动失败，请稍后在应用内重试");
+            return;
+        }
         refreshUi();
         toast("已开启乘车提示");
     }
@@ -836,7 +881,13 @@ public final class MainActivity extends Activity {
     private void disableJourneyService() {
         prefs.setJourneyEnabled(false);
         Intent service = new Intent(this, TrackingService.class).setAction(TrackingService.ACTION_DISABLE_JOURNEY);
-        startService(service);
+        try {
+            startService(service);
+        } catch (RuntimeException ignored) {
+            refreshUi();
+            toast("乘车提示停止失败，请稍后重试");
+            return;
+        }
         refreshUi();
     }
 
@@ -880,10 +931,22 @@ public final class MainActivity extends Activity {
                     }
                 });
                 ReminderRuntimeCoordinator.cancelRestoreNotification(this);
+            } else if (state == ReminderStateLogic.State.RECOVERING) {
+                activeLabel.setText("●  正在自动恢复");
+                activeLabel.setTextColor(MUTED);
+                activeMeta.setText("定位暂时中断，正在有限重试");
+                activeAction.setText("停止");
+                activeAction.setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View view) {
+                        view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+                        stopReminder();
+                    }
+                });
+                ReminderRuntimeCoordinator.cancelRestoreNotification(this);
             } else if (state == ReminderStateLogic.State.WAITING_LOCATION) {
                 activeLabel.setText("●  等待定位");
                 activeLabel.setTextColor(MUTED);
-                activeMeta.setText("定位监听已建立，等待首个定位 · " + formatRadius(task.radiusMeters) + " 时提醒");
+                activeMeta.setText(getString(R.string.meta_awaiting_first_fix, formatRadius(task.radiusMeters)));
                 activeAction.setText("停止");
                 activeAction.setOnClickListener(new View.OnClickListener() {
                     @Override public void onClick(View view) {
@@ -907,8 +970,8 @@ public final class MainActivity extends Activity {
             } else {
                 activeLabel.setText("●  正在守候");
                 activeLabel.setTextColor(GREEN);
-                if (!Double.isNaN(task.lastDistanceMeters)) activeMeta.setText("距离约 " + formatDistance(task.lastDistanceMeters) + " · " + formatRadius(task.radiusMeters) + " 时提醒");
-                else activeMeta.setText("等待定位 · " + formatRadius(task.radiusMeters) + " 时提醒");
+                if (!Double.isNaN(task.lastDistanceMeters)) activeMeta.setText(getString(R.string.meta_distance_remaining, formatDistance(task.lastDistanceMeters), formatRadius(task.radiusMeters)));
+                else activeMeta.setText(getString(R.string.meta_waiting_location, formatRadius(task.radiusMeters)));
                 activeAction.setText("停止");
                 activeAction.setOnClickListener(new View.OnClickListener() {
                     @Override public void onClick(View view) {
@@ -1058,11 +1121,15 @@ public final class MainActivity extends Activity {
         }
         if (!hasPlaceSearchProvider()) { toast("设备没有可用的地点搜索服务"); return; }
         toast("正在识别地点…");
-        new Thread(new Runnable() {
+        final long activityToken = activityGeneration;
+        final long resultToken = fixedPlaceResults.begin();
+        if (fixedPlaceFuture != null) fixedPlaceFuture.cancel(true);
+        fixedPlaceFuture = placeSearchExecutor.submit(new Runnable() {
             @Override public void run() {
                 final List<AppPrefs.Destination> places = queryPlaces(query, 6);
                 runOnUiThread(new Runnable() {
                     @Override public void run() {
+                        if (!isActivityCallbackValid(activityToken, resultToken, fixedPlaceResults)) return;
                         if (places.isEmpty()) { toast("没有找到该地点，请输入城市或更具体的名称"); return; }
                         if (places.size() == 1) { saveFixedAlarm(places.get(0), hour, minute, daysMask); return; }
                         showDestinationChoices(places, "确认固定目的地",
@@ -1070,7 +1137,7 @@ public final class MainActivity extends Activity {
                     }
                 });
             }
-        }, "private-fixed-place-search").start();
+        });
     }
 
     private void saveFixedAlarm(AppPrefs.Destination destination, int hour, int minute, int daysMask) {
@@ -1143,18 +1210,18 @@ public final class MainActivity extends Activity {
     private void showSettings() {
         LinearLayout content = column();
         content.setPadding(dp(18), dp(8), dp(18), dp(8));
-        final TextView radiusLabel = text("提醒距离  ·  " + formatRadius(prefs.getRadius()), 15, Typeface.BOLD, INK);
+        final TextView radiusLabel = text(getString(R.string.radius_label, formatRadius(prefs.getRadius())), 15, Typeface.BOLD, INK);
         final SeekBar radius = new SeekBar(this);
         radius.setMax(47);
         radius.setProgress((prefs.getRadius() - 300) / 100);
         radius.setProgressTintList(ColorStateList.valueOf(GREEN));
         radius.setThumbTintList(ColorStateList.valueOf(GREEN));
         radius.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) { radiusLabel.setText("提醒距离  ·  " + formatRadius(300 + progress * 100)); }
+            @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) { radiusLabel.setText(getString(R.string.radius_label, formatRadius(300 + progress * 100))); }
             @Override public void onStartTrackingTouch(SeekBar seekBar) {}
             @Override public void onStopTrackingTouch(SeekBar seekBar) {}
         });
-        TextView privacy = text("地点搜索会使用地图 POI 服务。搜索关键词及可选的附近坐标会发送给地点服务；到站距离只在本机计算。", 13, Typeface.NORMAL, MUTED);
+        TextView privacy = text("地点搜索会使用地图 POI 服务。搜索关键词及可选的附近坐标会发送给地点服务；导入带坐标的目的地会先交给系统 Geocoder 反查地址；到站距离只在本机计算。", 13, Typeface.NORMAL, MUTED);
         privacy.setLineSpacing(dp(3), 1f);
         privacy.setPadding(0, dp(16), 0, dp(6));
         content.addView(radiusLabel, matchWrap());
@@ -1177,7 +1244,11 @@ public final class MainActivity extends Activity {
                 .setNegativeButton("取消", null).setPositiveButton("清空", (dialog, which) -> {
                     for (AppPrefs.FixedAlarm alarm : prefs.getFixedAlarms()) ScheduleManager.cancel(MainActivity.this, alarm.id);
                     Intent service = new Intent(this, TrackingService.class).setAction(TrackingService.ACTION_CLEAR_ALL);
-                    startService(service);
+                    try {
+                        startService(service);
+                    } catch (RuntimeException ignored) {
+                        toast("服务停止失败，但本机任务仍会清除");
+                    }
                     prefs.clearAll();
                     refreshUi();
                     toast("本机数据已清空");
@@ -1185,8 +1256,9 @@ public final class MainActivity extends Activity {
     }
 
     private void showPrivacy() {
-        String message = "只在你主动开始到站提醒后使用位置；停止提醒后立即停止定位。\n\n" +
+        String message = "搜索地点时，应用可能在已授权定位的情况下读取系统保存的最近位置作为查询条件；只有在你主动开始到站提醒后才会持续使用位置，停止提醒或到站触发后立即停止定位。\n\n" +
                 "地点候选默认由 Photon/OpenStreetMap 提供；若开发者构建时配置了高德服务，则优先使用高德。搜索关键词和可选的附近坐标会直接发送给地点服务，结果仅做本机会话缓存；应用没有自己的业务服务器。\n\n" +
+                "导入或粘贴带经纬度的目的地时，应用会在你确认之前把该目的地坐标交给系统 Geocoder 反查地址；该系统服务是否联网及实际提供方由设备决定。\n\n" +
                 "目的地、最近地点、提醒半径和设置只保存在本机。应用不读取其他 App 的通知或使用记录。\n\n" +
                 "强制结束应用、关闭定位、静音/勿扰或地下无信号时，闹钟可能无法触发。";
         showStyledDialog(new AlertDialog.Builder(this).setTitle("隐私与能力边界").setMessage(message)
@@ -1340,6 +1412,9 @@ public final class MainActivity extends Activity {
         return dialog;
     }
 
+    // 该监听只做按压缩放动画并始终返回 false，点击事件仍由 View 自身处理，
+    // 因此不会影响 TalkBack 等无障碍点击，无需再调用 performClick（重复调用反而会触发两次点击）。
+    @SuppressLint("ClickableViewAccessibility")
     private void applyPressFeedback(final View view) {
         view.setOnTouchListener(new View.OnTouchListener() {
             @Override public boolean onTouch(View target, MotionEvent event) {
@@ -1356,7 +1431,7 @@ public final class MainActivity extends Activity {
     }
 
     private void animateEntrance(final View root) {
-        if (Build.VERSION.SDK_INT >= 26 && !ValueAnimator.areAnimatorsEnabled()) return;
+        if (!ValueAnimator.areAnimatorsEnabled()) return;
         root.setAlpha(0f);
         root.setTranslationY(dp(8));
         root.post(new Runnable() {
@@ -1371,7 +1446,6 @@ public final class MainActivity extends Activity {
     private String idFor(String name, double lat, double lng) { return Integer.toHexString((name + ":" + lat + ":" + lng).hashCode()); }
 
     private void hideKeyboard() { ((InputMethodManager) getSystemService(INPUT_METHOD_SERVICE)).hideSoftInputFromWindow(destinationInput.getWindowToken(), 0); }
-    private void showKeyboard() { ((InputMethodManager) getSystemService(INPUT_METHOD_SERVICE)).showSoftInput(destinationInput, InputMethodManager.SHOW_IMPLICIT); }
     private void toast(String message) { Toast.makeText(this, message, Toast.LENGTH_SHORT).show(); }
     private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
     private LinearLayout column() { LinearLayout layout = new LinearLayout(this); layout.setOrientation(LinearLayout.VERTICAL); return layout; }

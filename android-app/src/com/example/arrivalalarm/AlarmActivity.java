@@ -1,6 +1,7 @@
 package com.example.arrivalalarm;
 
 import android.app.Activity;
+import android.annotation.SuppressLint;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -67,12 +68,21 @@ public final class AlarmActivity extends Activity {
         arrived.setBackground(roundRect(Color.rgb(0, 122, 255), 16));
         arrived.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View view) {
-                view.performHapticFeedback(HapticFeedbackConstants.CONFIRM);
+                if (Build.VERSION.SDK_INT >= 30) view.performHapticFeedback(HapticFeedbackConstants.CONFIRM);
+                else view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
                 ReminderRuntimeCoordinator.stopReminder(AlarmActivity.this);
                 finish();
             }
         });
-        arrived.setOnTouchListener(new View.OnTouchListener() {
+        attachPressFeedback(arrived);
+        root.addView(arrived, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(58)));
+        setContentView(root);
+    }
+
+    // 该监听只做按压缩放动画并始终返回 false，点击仍由按钮自身处理，因此无需再调用 performClick。
+    @SuppressLint("ClickableViewAccessibility")
+    private void attachPressFeedback(final Button button) {
+        button.setOnTouchListener(new View.OnTouchListener() {
             @Override public boolean onTouch(View view, MotionEvent event) {
                 if (event.getActionMasked() == MotionEvent.ACTION_DOWN) view.animate().scaleX(0.97f).scaleY(0.97f).setDuration(80).start();
                 else if (event.getActionMasked() == MotionEvent.ACTION_UP || event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
@@ -81,8 +91,6 @@ public final class AlarmActivity extends Activity {
                 return false;
             }
         });
-        root.addView(arrived, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(58)));
-        setContentView(root);
     }
 
     private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }

@@ -10,12 +10,16 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.SystemClock;
 
 /** Coordinates user commands and the foreground service without exposing runtime state to the UI. */
 public final class ReminderRuntimeCoordinator {
     public static final int RESTORE_NOTIFICATION_ID = 300;
 
     private static final String CHANNEL_RESTORE = "manual_restore";
+    private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
 
     private ReminderRuntimeCoordinator() {}
 
@@ -33,7 +37,8 @@ public final class ReminderRuntimeCoordinator {
         AppPrefs prefs = new AppPrefs(context);
         AppPrefs.ReminderTask task = prefs.getTask();
         ReminderStateLogic.State state = ReminderStateLogic.classify(task, runtime, nowElapsedRealtime);
-        if (state == ReminderStateLogic.State.NEEDS_RESUME && task != null && task.isActive()) {
+        if (state == ReminderStateLogic.State.NEEDS_RESUME && task != null
+                && (task.isActive() || task.isStarting())) {
             task.markInterrupted();
             prefs.saveTask(task);
             context.stopService(new Intent(context, TrackingService.class));
@@ -74,7 +79,6 @@ public final class ReminderRuntimeCoordinator {
     }
 
     public static void ensureRestoreNotificationChannel(Context context) {
-        if (Build.VERSION.SDK_INT < 26) return;
         NotificationManager manager = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
         if (manager == null) return;
         NotificationChannel channel = new NotificationChannel(
@@ -122,20 +126,47 @@ public final class ReminderRuntimeCoordinator {
     }
 
     private static boolean startPersistedReminder(Context context) {
-        AppPrefs.ReminderTask task = new AppPrefs(context).getTask();
+        Context appContext = context.getApplicationContext();
+        if (appContext == null) appContext = context;
+        AppPrefs prefs = new AppPrefs(appContext);
+        AppPrefs.ReminderTask task = prefs.getTask();
         if (task == null) return false;
+        cancelRestoreNotification(appContext);
+        task.status = AppPrefs.ReminderTask.STATUS_STARTING;
+        prefs.saveTask(task);
         TrackingService.markStartRequested();
         try {
-            Intent service = new Intent(context, TrackingService.class)
+            Intent service = new Intent(appContext, TrackingService.class)
                     .setAction(TrackingService.ACTION_START_REMINDER);
-            context.startForegroundService(service);
+            appContext.startForegroundService(service);
+            scheduleStartTimeout(appContext, task.id);
             return true;
         } catch (RuntimeException blocked) {
             task.markInterrupted();
-            new AppPrefs(context).saveTask(task);
+            prefs.saveTask(task);
             TrackingService.markStartFailed();
-            showRestoreNotification(context, task, "系统暂时不允许启动定位服务。");
+            showRestoreNotification(appContext, task, "系统暂时不允许启动定位服务。");
             return false;
         }
+    }
+
+    private static void scheduleStartTimeout(final Context context, final String taskId) {
+        MAIN_HANDLER.postDelayed(new Runnable() {
+            @Override public void run() {
+                AppPrefs prefs = new AppPrefs(context);
+                AppPrefs.ReminderTask task = prefs.getTask();
+                ReminderRuntime.Snapshot runtime = TrackingService.getRuntimeSnapshot();
+                if (task == null || !task.id.equals(taskId) || !task.isStarting()) return;
+                if (runtime != null && runtime.state == ReminderRuntime.State.LOCATION_READY) return;
+                if (runtime != null && runtime.state == ReminderRuntime.State.RECOVERING) return;
+                if (runtime != null && runtime.state == ReminderRuntime.State.STARTING
+                        && runtime.isStartFresh(SystemClock.elapsedRealtime())) return;
+                task.markInterrupted();
+                prefs.saveTask(task);
+                TrackingService.markStartFailed();
+                context.stopService(new Intent(context, TrackingService.class));
+                showRestoreNotification(context, task, "服务没有在规定时间内建立定位监听。");
+            }
+        }, ReminderRuntime.START_TIMEOUT_MS + 250L);
     }
 }

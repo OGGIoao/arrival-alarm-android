@@ -20,6 +20,9 @@ public final class CoreLogicTest {
         testAmapDestinationLink();
         testAmapMobileLink();
         testBaiduMarkerLink();
+        testTencentMapLink();
+        testUnknownCoordinateSourceKeepsRawValue();
+        testBd09ToGcj02RoundTrip();
         testEncodedMapLink();
         testInvalidCoordinatesRejected();
         testTransitSignal();
@@ -30,6 +33,7 @@ public final class CoreLogicTest {
         testFixedAlarmLaterToday();
         testFixedAlarmSkipsWeekend();
         testEverydayAlarmAdvances();
+        testLocationRecoveryPolicy();
         testReminderStateMachine();
         testReminderProviderRegistry();
         testAmapCoordinateConversion();
@@ -39,6 +43,7 @@ public final class CoreLogicTest {
         testRepeatedSuggestionStateRendersOnce();
         testSuggestionGateResets();
         testFastSearchDebounce();
+        testAsyncResultGate();
         System.out.println("CoreLogicTest: " + passed + " tests passed");
     }
 
@@ -104,7 +109,11 @@ public final class CoreLogicTest {
 
     private static void testAmapDestinationLink() {
         PlaceInputParser.Result result = PlaceInputParser.parse("https://uri.amap.com/navigation?to=121.4557,31.2495,上海站");
-        check(result != null && result.hasCoordinates() && close(result.longitude, 121.4557) && "上海站".equals(result.name), "amap destination");
+        check(result != null && result.hasCoordinates() && "上海站".equals(result.name), "amap destination");
+        check(result.coordinateSystemVerified, "amap coordinate system recognised");
+        double[] backToGcj = CoordinateTransform.wgs84ToGcj02(result.latitude, result.longitude);
+        check(Math.abs(backToGcj[0] - 31.2495) < 0.00002 && Math.abs(backToGcj[1] - 121.4557) < 0.00002,
+                "amap link coordinates converted from GCJ-02");
     }
 
     private static void testAmapMobileLink() {
@@ -114,7 +123,40 @@ public final class CoreLogicTest {
 
     private static void testBaiduMarkerLink() {
         PlaceInputParser.Result result = PlaceInputParser.parse("baidumap://map/marker?location=31.2495,121.4557&title=上海站");
-        check(result != null && result.hasCoordinates() && close(result.latitude, 31.2495) && "上海站".equals(result.name), "baidu marker");
+        check(result != null && result.hasCoordinates() && "上海站".equals(result.name), "baidu marker");
+        check(result.coordinateSystemVerified, "baidu coordinate system recognised");
+        double dLat = result.latitude - 31.2495;
+        double dLng = result.longitude - 121.4557;
+        double shift = Math.sqrt(dLat * dLat + dLng * dLng);
+        check(shift > 0.003 && shift < 0.03, "baidu link coordinates converted away from BD-09");
+    }
+
+    private static void testTencentMapLink() {
+        PlaceInputParser.Result result = PlaceInputParser.parse("https://map.qq.com/?location=31.2495,121.4557&title=上海站");
+        check(result != null && result.hasCoordinates(), "tencent map coordinates");
+        check(result.coordinateSystemVerified, "tencent coordinate system recognised");
+        double[] backToGcj = CoordinateTransform.wgs84ToGcj02(result.latitude, result.longitude);
+        check(Math.abs(backToGcj[0] - 31.2495) < 0.00002 && Math.abs(backToGcj[1] - 121.4557) < 0.00002,
+                "tencent link coordinates converted from GCJ-02");
+    }
+
+    private static void testUnknownCoordinateSourceKeepsRawValue() {
+        PlaceInputParser.Result result = PlaceInputParser.parse("https://maps.google.com/?q=31.2495,121.4557");
+        check(result != null && result.hasCoordinates() && !result.coordinateSystemVerified, "unknown source flagged");
+        check(close(result.latitude, 31.2495) && close(result.longitude, 121.4557), "unknown source not converted");
+    }
+
+    private static void testBd09ToGcj02RoundTrip() {
+        double gcjLat = 39.915119;
+        double gcjLng = 116.403963;
+        double z = Math.sqrt(gcjLng * gcjLng + gcjLat * gcjLat)
+                + 0.00002 * Math.sin(gcjLat * Math.PI * 3000.0 / 180.0);
+        double theta = Math.atan2(gcjLat, gcjLng)
+                + 0.000003 * Math.cos(gcjLng * Math.PI * 3000.0 / 180.0);
+        double bdLat = z * Math.sin(theta) + 0.006;
+        double bdLng = z * Math.cos(theta) + 0.0065;
+        double[] gcj = CoordinateTransform.bd09ToGcj02(bdLat, bdLng);
+        check(Math.abs(gcj[0] - gcjLat) < 0.00002 && Math.abs(gcj[1] - gcjLng) < 0.00002, "bd09 to gcj02 round trip");
     }
 
     private static void testEncodedMapLink() {
@@ -189,6 +231,17 @@ public final class CoreLogicTest {
                 "active task without service needs immediate resume");
         check(ReminderStateLogic.classify(task, starting, 120_001L) == ReminderStateLogic.State.STARTING,
                 "start request is not monitoring");
+        task.status = AppPrefs.ReminderTask.STATUS_STARTING;
+        check(ReminderStateLogic.classify(task, ReminderRuntime.Snapshot.stopped(), 120_001L)
+                        == ReminderStateLogic.State.NEEDS_RESUME,
+                "starting task without service needs recovery");
+        check(ReminderStateLogic.classify(task, located, 120_001L)
+                        == ReminderStateLogic.State.STARTING,
+                "starting task tolerates location-ready handshake without claiming monitoring");
+        check(ReminderStateLogic.classify(task, ReminderRuntime.Snapshot.foreground(120_000L, 120_000L), 120_001L)
+                        == ReminderStateLogic.State.STARTING,
+                "starting task tolerates foreground handshake");
+        task.status = AppPrefs.ReminderTask.STATUS_ACTIVE;
         check(ReminderStateLogic.classify(task, ready, 120_001L) == ReminderStateLogic.State.WAITING_LOCATION,
                 "registered listener waits for first location");
         check(ReminderStateLogic.classify(task, ReminderRuntime.Snapshot.locationReady(0, 120_000L, 120_000L, 0L), 120_001L)
@@ -202,18 +255,50 @@ public final class CoreLogicTest {
                 "stalled foreground startup needs resume");
         check(ReminderStateLogic.classify(task, located, 120_001L) == ReminderStateLogic.State.MONITORING,
                 "location-ready service is monitoring");
+        ReminderRuntime.Snapshot recovering = ReminderRuntime.Snapshot.recovering(
+                2, 1, 121_000L, 121_000L, 120_001L);
+        check(ReminderStateLogic.classify(task, recovering, 121_001L) == ReminderStateLogic.State.RECOVERING,
+                "bounded location recovery is visible without claiming monitoring");
+        check(ReminderStateLogic.classify(task, recovering,
+                        121_001L + ReminderRuntime.HEARTBEAT_TIMEOUT_MS + 1L)
+                        == ReminderStateLogic.State.NEEDS_RESUME,
+                "stale recovery service needs resume");
+        check(ReminderStateLogic.classify(task, ready.heartbeat(120_000L + ReminderRuntime.LOCATION_TIMEOUT_MS),
+                        120_000L + ReminderRuntime.LOCATION_TIMEOUT_MS)
+                        == ReminderStateLogic.State.WAITING_LOCATION,
+                "first location is allowed within location timeout");
+        check(ReminderStateLogic.classify(task, ready.heartbeat(120_000L + ReminderRuntime.LOCATION_TIMEOUT_MS + 1L),
+                        120_000L + ReminderRuntime.LOCATION_TIMEOUT_MS + 1L)
+                        == ReminderStateLogic.State.NEEDS_RESUME,
+                "missing first location eventually needs resume");
+        check(ReminderStateLogic.classify(task, located.heartbeat(
+                        120_001L + ReminderRuntime.LOCATION_TIMEOUT_MS + 1L)
+                        , 120_001L + ReminderRuntime.LOCATION_TIMEOUT_MS + 1L)
+                        == ReminderStateLogic.State.NEEDS_RESUME,
+                "stale location eventually needs resume");
         check(ReminderStateLogic.classify(task, stale, 250_000L) == ReminderStateLogic.State.NEEDS_RESUME,
                 "stale service heartbeat needs resume");
         task.markInterrupted();
         check(ReminderStateLogic.classify(task, located, 250_000L) == ReminderStateLogic.State.NEEDS_RESUME,
                 "interrupted task stays resumable");
         task.resume();
-        check(task.isActive() && ReminderStateLogic.classify(task,
+        check(task.isStarting() && ReminderStateLogic.classify(task,
                         ReminderRuntime.Snapshot.starting(300_000L), 300_001L) == ReminderStateLogic.State.STARTING,
                 "resumed task starts before monitoring");
+        task.markActive();
+        check(task.isActive(), "service confirms active task");
         task.status = AppPrefs.ReminderTask.STATUS_ALERTING;
         check(ReminderStateLogic.classify(task, ReminderRuntime.Snapshot.stopped(), 300_001L) == ReminderStateLogic.State.ALERTING,
                 "alerting task remains alerting");
+    }
+
+    private static void testLocationRecoveryPolicy() {
+        check(LocationRecoveryPolicy.MAX_ATTEMPTS == 2, "location recovery has a hard retry limit");
+        check(LocationRecoveryPolicy.hasAttemptsRemaining(0), "initial recovery attempt is allowed");
+        check(LocationRecoveryPolicy.hasAttemptsRemaining(1), "second recovery attempt is allowed");
+        check(!LocationRecoveryPolicy.hasAttemptsRemaining(2), "recovery stops after two attempts");
+        check(LocationRecoveryPolicy.delayAfterAttempt(1) == 10_000L, "first recovery retry uses 10 seconds");
+        check(LocationRecoveryPolicy.delayAfterAttempt(2) == 30_000L, "second recovery retry uses 30 seconds");
     }
 
     private static void testAmapCoordinateConversion() {
@@ -279,6 +364,17 @@ public final class CoreLogicTest {
     private static void testFastSearchDebounce() {
         check(InteractionGate.searchDebounceMillis(false) == 120, "default search debounce");
         check(InteractionGate.searchDebounceMillis(true) == 80, "amap search debounce");
+    }
+
+    private static void testAsyncResultGate() {
+        AsyncResultGate gate = new AsyncResultGate();
+        long first = gate.begin();
+        check(gate.isCurrent(first), "first async result is current");
+        long second = gate.begin();
+        check(!gate.isCurrent(first), "new async request invalidates the old result");
+        check(gate.isCurrent(second), "new async result is current");
+        gate.invalidate();
+        check(!gate.isCurrent(second), "cancellation invalidates the active result");
     }
 
     private static Calendar date(TimeZone zone, int year, int month, int day, int hour, int minute) {
