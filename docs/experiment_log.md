@@ -181,6 +181,7 @@
 - P0-1～P0-5 总表和未完成项见 RELEASE_READINESS.md 的 2026-10-06 检查点；各项保留 PARTIAL，整体 NOT READY。
 - 备份：项目负责人明确授权将当前工作区保存为 Git checkpoint 并推送 GitHub 独立备份分支。该快照包含已有未提交改动，不作为逐项修复完成、发布或完整 review 的证明。不纳入安装器、SDK、AVD、产物、密钥和本地配置。
 - 备份分支：`codex/checkpoint-20261006-deferred-device-validation`；提交说明 `chore: checkpoint hardening work pending device validation`。可通过该分支的 Git 历史找到本次源码快照。
+- 项目负责人随后明确确认上传目的地 `https://github.com/yueqiu666/arrival-alarm-android`，并要求作为第 1 部分修改分支整合保存。上传分支采用 `codex/part-1-modifications`，包含源码快照 `25cd5eb` 与本条记录；原本地 checkpoint 分支保留。设备验收及发布状态不因推送而改变。
 - 本次备份检查：离线 `testDebugUnitTest` 实际执行 PASS（GradleCoreLogicTest > existingCoreSuitePasses PASSED，BUILD SUCCESSFUL）；`git diff --check` PASS；新增内容及未跟踪源码/文档常见敏感凭据模式扫描无命中。未重跑完整 Release/Lint/设备验收；历史证据继续单独保留。
 - 后续恢复：先完成已确认修复，再使用已有 SDK/AVD 开展统一验收；测试入口失败时记录明确日志并停止无效重试。补充 Android 最低/当前版本覆盖、权限与后台/锁屏、进程恢复、异步回调及各修复交互；厂商省电场景留待真机。
 
