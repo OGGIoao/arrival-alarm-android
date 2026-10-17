@@ -31,6 +31,9 @@ public final class CoreLogicTest {
         testFixedAlarmSkipsWeekend();
         testEverydayAlarmAdvances();
         testAmapCoordinateConversion();
+        testBaiduCoordinateConversion();
+        testOverseasCoordinatesUnchanged();
+        testShareCoordinateSystems();
         testRejectsBrokenSystemPlace();
         testAcceptsRelevantPlaceSuggestion();
         testRecoversTruncatedSystemPlaceName();
@@ -99,17 +102,29 @@ public final class CoreLogicTest {
 
     private static void testAmapDestinationLink() {
         PlaceInputParser.Result result = PlaceInputParser.parse("https://uri.amap.com/navigation?to=121.4557,31.2495,上海站");
-        check(result != null && result.hasCoordinates() && close(result.longitude, 121.4557) && "上海站".equals(result.name), "amap destination");
+        check(result != null && result.hasCoordinates() && close(result.longitude, 121.4557) && "上海站".equals(result.name)
+                && result.coordinateSystem == CoordinateTransform.CoordinateSystem.GCJ02, "amap destination");
+        double[] gcj = CoordinateTransform.wgs84ToGcj02(result.wgs84()[0], result.wgs84()[1]);
+        check(near(gcj[0], 31.2495) && near(gcj[1], 121.4557) && !near(result.wgs84()[0], 31.2495), "amap destination wgs84");
     }
 
     private static void testAmapMobileLink() {
-        PlaceInputParser.Result result = PlaceInputParser.parse("androidamap://viewMap?poiname=上海站&lat=31.2495&lon=121.4557&dev=1");
-        check(result != null && result.hasCoordinates() && "上海站".equals(result.name), "amap mobile");
+        PlaceInputParser.Result result = PlaceInputParser.parse("androidamap://viewMap?poiname=上海站&lat=31.2495&lon=121.4557&dev=0");
+        check(result != null && result.hasCoordinates() && "上海站".equals(result.name)
+                && result.coordinateSystem == CoordinateTransform.CoordinateSystem.GCJ02, "amap mobile");
+        PlaceInputParser.Result gps = PlaceInputParser.parse("androidamap://viewMap?poiname=上海站&lat=31.2495&lon=121.4557&dev=1");
+        check(gps != null && gps.coordinateSystem == CoordinateTransform.CoordinateSystem.WGS84
+                && close(gps.wgs84()[0], 31.2495), "amap mobile dev=1 is wgs84");
     }
 
     private static void testBaiduMarkerLink() {
         PlaceInputParser.Result result = PlaceInputParser.parse("baidumap://map/marker?location=31.2495,121.4557&title=上海站");
-        check(result != null && result.hasCoordinates() && close(result.latitude, 31.2495) && "上海站".equals(result.name), "baidu marker");
+        check(result != null && result.hasCoordinates() && close(result.latitude, 31.2495) && "上海站".equals(result.name)
+                && result.coordinateSystem == CoordinateTransform.CoordinateSystem.BD09, "baidu marker");
+        double[] wgs = result.wgs84();
+        double[] bd = CoordinateTransform.gcj02ToBd09(CoordinateTransform.wgs84ToGcj02(wgs[0], wgs[1])[0],
+                CoordinateTransform.wgs84ToGcj02(wgs[0], wgs[1])[1]);
+        check(near(bd[0], 31.2495) && near(bd[1], 121.4557) && !near(wgs[1], 121.4557), "baidu marker wgs84");
     }
 
     private static void testEncodedMapLink() {
@@ -179,6 +194,44 @@ public final class CoreLogicTest {
                 "amap coordinate conversion");
     }
 
+    private static void testBaiduCoordinateConversion() {
+        double wgsLat = 39.908823;
+        double wgsLng = 116.397470;
+        double[] gcj = CoordinateTransform.wgs84ToGcj02(wgsLat, wgsLng);
+        double[] bd = CoordinateTransform.gcj02ToBd09(gcj[0], gcj[1]);
+        double[] backToGcj = CoordinateTransform.bd09ToGcj02(bd[0], bd[1]);
+        double[] restored = CoordinateTransform.bd09ToWgs84(bd[0], bd[1]);
+        check(Math.abs(bd[1] - wgsLng) > 0.005 && near(backToGcj[0], gcj[0]) && near(backToGcj[1], gcj[1]),
+                "baidu gcj round trip");
+        check(near(restored[0], wgsLat) && near(restored[1], wgsLng), "baidu wgs round trip");
+    }
+
+    private static void testOverseasCoordinatesUnchanged() {
+        double[] gcj = CoordinateTransform.gcj02ToWgs84(48.858370, 2.294481);
+        double[] bd = CoordinateTransform.bd09ToWgs84(48.858370, 2.294481);
+        double[] toBd = CoordinateTransform.gcj02ToBd09(48.858370, 2.294481);
+        check(close(gcj[0], 48.858370) && close(gcj[1], 2.294481) && close(bd[0], 48.858370) && close(bd[1], 2.294481)
+                && close(toBd[0], 48.858370) && close(toBd[1], 2.294481), "overseas coordinates unchanged");
+        PlaceInputParser.Result result = PlaceInputParser.parse("baidumap://map/marker?location=48.858370,2.294481&title=Tour");
+        check(result != null && close(result.wgs84()[0], 48.858370) && close(result.wgs84()[1], 2.294481), "overseas share unchanged");
+    }
+
+    private static void testShareCoordinateSystems() {
+        check(PlaceInputParser.parse("上海站 31.2495,121.4557").coordinateSystem == CoordinateTransform.CoordinateSystem.WGS84,
+                "manual coordinates are wgs84");
+        PlaceInputParser.Result tencent = PlaceInputParser.parse("qqmap://map/marker?marker=coord:31.2495,121.4557;title:上海站");
+        check(tencent != null && tencent.hasCoordinates() && tencent.coordinateSystem == CoordinateTransform.CoordinateSystem.GCJ02,
+                "tencent is gcj02");
+        PlaceInputParser.Result tencentGps = PlaceInputParser.parse("https://map.qq.com/?type=marker&marker=coord:31.2495,121.4557&coord_type=1");
+        check(tencentGps != null && tencentGps.coordinateSystem == CoordinateTransform.CoordinateSystem.WGS84, "tencent coord_type=1");
+        PlaceInputParser.Result baiduGcj = PlaceInputParser.parse("baidumap://map/marker?location=31.2495,121.4557&coord_type=gcj02&title=上海站");
+        check(baiduGcj != null && baiduGcj.coordinateSystem == CoordinateTransform.CoordinateSystem.GCJ02, "baidu coord_type=gcj02");
+        PlaceInputParser.Result baiduWgs = PlaceInputParser.parse("https://map.baidu.com/?latlng=31.2495,121.4557&coordtype=wgs84ll");
+        check(baiduWgs != null && baiduWgs.coordinateSystem == CoordinateTransform.CoordinateSystem.WGS84, "baidu coordtype=wgs84ll");
+        PlaceInputParser.Result amapWgs = PlaceInputParser.parse("https://uri.amap.com/marker?position=121.4557,31.2495&coordinate=wgs84");
+        check(amapWgs != null && amapWgs.coordinateSystem == CoordinateTransform.CoordinateSystem.WGS84, "amap coordinate=wgs84");
+    }
+
     private static void testRejectsBrokenSystemPlace() {
         check(!PlaceQuality.isRelevant("成都sm广场", "场", "成都市", "四川省成都市成华区场"),
                 "reject broken system place");
@@ -206,6 +259,9 @@ public final class CoreLogicTest {
     }
 
     private static boolean close(double first, double second) { return Math.abs(first - second) < 0.000001; }
+
+    /** Within about 2 m; the GCJ-02 inverse used here is a single-step approximation. */
+    private static boolean near(double first, double second) { return Math.abs(first - second) < 0.00002; }
 
     private static void check(boolean condition, String name) {
         if (!condition) throw new AssertionError(name);

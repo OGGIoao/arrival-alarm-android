@@ -4,8 +4,40 @@ public final class CoordinateTransform {
     private static final double PI = Math.PI;
     private static final double A = 6378245.0;
     private static final double EE = 0.00669342162296594323;
+    private static final double X_PI = PI * 3000.0 / 180.0;
+
+    public enum CoordinateSystem { WGS84, GCJ02, BD09, UNKNOWN }
 
     private CoordinateTransform() { }
+
+    /** Unknown input is treated as WGS-84, the system used by GPS and most non-China map links. */
+    public static double[] toWgs84(double latitude, double longitude, CoordinateSystem system) {
+        if (system == CoordinateSystem.GCJ02) return gcj02ToWgs84(latitude, longitude);
+        if (system == CoordinateSystem.BD09) return bd09ToWgs84(latitude, longitude);
+        return new double[]{latitude, longitude};
+    }
+
+    public static double[] bd09ToWgs84(double latitude, double longitude) {
+        if (outsideChina(latitude, longitude)) return new double[]{latitude, longitude};
+        double[] gcj = bd09ToGcj02(latitude, longitude);
+        return gcj02ToWgs84(gcj[0], gcj[1]);
+    }
+
+    public static double[] bd09ToGcj02(double latitude, double longitude) {
+        if (outsideChina(latitude, longitude)) return new double[]{latitude, longitude};
+        double x = longitude - 0.0065;
+        double y = latitude - 0.006;
+        double z = Math.sqrt(x * x + y * y) - 0.00002 * Math.sin(y * X_PI);
+        double theta = Math.atan2(y, x) - 0.000003 * Math.cos(x * X_PI);
+        return new double[]{z * Math.sin(theta), z * Math.cos(theta)};
+    }
+
+    public static double[] gcj02ToBd09(double latitude, double longitude) {
+        if (outsideChina(latitude, longitude)) return new double[]{latitude, longitude};
+        double z = Math.sqrt(longitude * longitude + latitude * latitude) + 0.00002 * Math.sin(latitude * X_PI);
+        double theta = Math.atan2(latitude, longitude) + 0.000003 * Math.cos(longitude * X_PI);
+        return new double[]{z * Math.sin(theta) + 0.006, z * Math.cos(theta) + 0.0065};
+    }
 
     public static double[] gcj02ToWgs84(double latitude, double longitude) {
         if (outsideChina(latitude, longitude)) return new double[]{latitude, longitude};

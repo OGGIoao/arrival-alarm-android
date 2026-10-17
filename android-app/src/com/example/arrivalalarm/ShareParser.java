@@ -33,7 +33,9 @@ public final class ShareParser {
     public static ParsedShare parseText(String text) {
         PlaceInputParser.Result parsed = PlaceInputParser.parse(text);
         if (parsed == null) return null;
-        return new ParsedShare(parsed.name, parsed.latitude, parsed.longitude, parsed.source);
+        double[] wgs = parsed.wgs84();
+        if (wgs == null) return new ParsedShare(parsed.name, null, null, parsed.source);
+        return new ParsedShare(parsed.name, wgs[0], wgs[1], parsed.source);
     }
 
     public static boolean isTravelWebsite(Intent intent) {
@@ -60,6 +62,7 @@ public final class ShareParser {
 
     public static final class ParsedShare {
         public final String name;
+        /** WGS-84, matching GPS fixes used by TrackingService. */
         public final Double latitude;
         public final Double longitude;
         public final String source;

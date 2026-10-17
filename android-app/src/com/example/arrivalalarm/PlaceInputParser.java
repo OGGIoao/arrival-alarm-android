@@ -1,5 +1,6 @@
 package com.example.arrivalalarm;
 
+import com.example.arrivalalarm.CoordinateTransform.CoordinateSystem;
 import java.net.URLDecoder;
 import java.util.Locale;
 import java.util.regex.Matcher;
@@ -17,6 +18,8 @@ public final class PlaceInputParser {
     private static final Pattern PAIR = Pattern.compile(NUMBER + "\\s*[,，]\\s*" + NUMBER);
     private static final Pattern URL = Pattern.compile("(?:https?|geo|amapuri|androidamap|baidumap|qqmap)://\\S+", Pattern.CASE_INSENSITIVE);
     private static final Pattern NAME_PARAM = Pattern.compile("(?:[?&#;]|\\b)(?:dname|poiname|title|name|address|addr)[:=]([^&#;]+)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern COORD_TYPE = Pattern.compile("(?:[?&#;]|\\b)(?:coord_type|coordtype|coordinate)=([a-z0-9_]+)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern AMAP_DEV = Pattern.compile("[?&#;]dev=([01])\\b");
     private static final Pattern QUERY_LABEL = Pattern.compile("(?:[?&#;]|\\b)q=" + NUMBER + "[,，]" + NUMBER + "\\(([^)]+)\\)", Pattern.CASE_INSENSITIVE);
 
     private PlaceInputParser() {}
@@ -84,7 +87,7 @@ public final class PlaceInputParser {
         }
 
         if (name.isEmpty() && lat == null) return null;
-        return new Result(name, lat, lng, source);
+        return new Result(name, lat, lng, source, lat == null ? CoordinateSystem.UNKNOWN : coordinateSystem(decoded, lower));
     }
 
     private static String sourceLabel(String lower) {
@@ -94,6 +97,27 @@ public final class PlaceInputParser {
         if (lower.contains("didi") || lower.contains("didiglobal")) return "打车软件分享";
         if (lower.contains("://")) return "外部链接";
         return "手动输入";
+    }
+
+    /** Amap and Tencent share GCJ-02 and Baidu shares BD-09 unless the link declares another system. */
+    static CoordinateSystem coordinateSystem(String decoded, String lower) {
+        boolean amap = lower.contains("amap.com") || lower.contains("amapuri://") || lower.contains("androidamap://");
+        boolean baidu = lower.contains("baidu.com") || lower.contains("baidumap://");
+        boolean tencent = lower.contains("map.qq.com") || lower.contains("qqmap://");
+        Matcher type = COORD_TYPE.matcher(decoded);
+        if (type.find()) {
+            String value = type.group(1).toLowerCase(Locale.ROOT);
+            if (value.startsWith("wgs") || value.equals("gps") || tencent && value.equals("1")) return CoordinateSystem.WGS84;
+            if (value.startsWith("gcj") || value.equals("gaode") || tencent && value.equals("2")) return CoordinateSystem.GCJ02;
+            if (value.equals("bd09ll") || value.equals("bd09")) return CoordinateSystem.BD09;
+        }
+        if (amap) {
+            Matcher dev = AMAP_DEV.matcher(decoded);
+            return dev.find() && "1".equals(dev.group(1)) ? CoordinateSystem.WGS84 : CoordinateSystem.GCJ02;
+        }
+        if (tencent) return CoordinateSystem.GCJ02;
+        if (baidu) return CoordinateSystem.BD09;
+        return lower.contains("://") ? CoordinateSystem.UNKNOWN : CoordinateSystem.WGS84;
     }
 
     private static String decodeTwice(String value) {
@@ -133,14 +157,22 @@ public final class PlaceInputParser {
         public final Double latitude;
         public final Double longitude;
         public final String source;
+        /** System of {@link #latitude}/{@link #longitude} as found in the input; see {@link #wgs84()}. */
+        public final CoordinateSystem coordinateSystem;
 
-        Result(String name, Double latitude, Double longitude, String source) {
+        Result(String name, Double latitude, Double longitude, String source, CoordinateSystem coordinateSystem) {
             this.name = name == null ? "" : name;
             this.latitude = latitude;
             this.longitude = longitude;
             this.source = source == null ? "手动输入" : source;
+            this.coordinateSystem = coordinateSystem == null ? CoordinateSystem.UNKNOWN : coordinateSystem;
         }
 
         public boolean hasCoordinates() { return latitude != null && longitude != null; }
+
+        /** Coordinates converted to WGS-84 for comparison with GPS fixes, or null without coordinates. */
+        public double[] wgs84() {
+            return hasCoordinates() ? CoordinateTransform.toWgs84(latitude, longitude, coordinateSystem) : null;
+        }
     }
 }
