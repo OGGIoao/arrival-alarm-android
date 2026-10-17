@@ -165,14 +165,28 @@ public final class TrackingService extends Service implements LocationListener {
         removeLocationUpdates();
         long minTime = precise ? 5_000L : 60_000L;
         float minDistance = precise ? 20f : 100f;
+        // Register every provider the device has, even if it is switched off right now: the system
+        // resumes updates and calls onProviderEnabled once the user turns it on.
+        List<String> providers = locationManager.getAllProviders();
         try {
-            if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+            if (providers.contains(LocationManager.GPS_PROVIDER)) {
                 locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, minTime, minDistance, this, Looper.getMainLooper());
             }
-            if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+            if (providers.contains(LocationManager.NETWORK_PROVIDER)) {
                 locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, precise ? 15_000L : minTime, precise ? 50f : minDistance, this, Looper.getMainLooper());
             }
         } catch (SecurityException ignored) { stopEverything(); }
+    }
+
+    private boolean isAnyProviderEnabled() {
+        return locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
+                || locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER);
+    }
+
+    private void refreshTrackingNotification() {
+        AppPrefs.ReminderTask task = prefs.getTask();
+        if (task != null && "active".equals(task.status)) notifications.notify(FOREGROUND_ID, buildTrackingNotification(task));
+        sendStatus();
     }
 
     @Override
@@ -186,8 +200,8 @@ public final class TrackingService extends Service implements LocationListener {
         else if (task == null && prefs.isJourneyEnabled()) processJourney(fix);
     }
 
-    @Override public void onProviderEnabled(String provider) {}
-    @Override public void onProviderDisabled(String provider) { sendStatus(); }
+    @Override public void onProviderEnabled(String provider) { refreshTrackingNotification(); }
+    @Override public void onProviderDisabled(String provider) { refreshTrackingNotification(); }
     @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
 
     private void processReminder(AppPrefs.ReminderTask task, CoreLogic.LocationFix fix) {
@@ -314,7 +328,8 @@ public final class TrackingService extends Service implements LocationListener {
         PendingIntent content = PendingIntent.getActivity(this, 10, open, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         Intent stopIntent = new Intent(this, ActionReceiver.class).setAction(ActionReceiver.ACTION_STOP_REMINDER);
         PendingIntent stop = PendingIntent.getBroadcast(this, 11, stopIntent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        String detail = Double.isNaN(task.lastDistanceMeters) ? "等待定位 · " + formatRadius(task.radiusMeters) + " 时提醒"
+        String detail = !isAnyProviderEnabled() ? "定位已关闭 · 打开后自动继续守候"
+                : Double.isNaN(task.lastDistanceMeters) ? "等待定位 · " + formatRadius(task.radiusMeters) + " 时提醒"
                 : "距离约 " + formatDistance(task.lastDistanceMeters) + " · 持续守候中";
         return new Notification.Builder(this, CHANNEL_TRACKING)
                 .setSmallIcon(com.example.arrivalalarm.R.drawable.ic_notification)
