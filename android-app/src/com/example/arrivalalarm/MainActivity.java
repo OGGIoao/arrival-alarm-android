@@ -977,14 +977,21 @@ public final class MainActivity extends Activity {
         content.addView(place, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52)));
         content.addView(time, matchWrap());
         content.addView(workdays, matchWrap());
-        showStyledDialog(new AlertDialog.Builder(this).setTitle("添加通勤预设").setView(content)
+        AlertDialog dialog = showStyledDialog(new AlertDialog.Builder(this).setTitle("添加通勤预设").setView(content)
                 .setNegativeButton("取消", null)
-                .setPositiveButton("保存", (dialog, which) -> {
-                    String query = place.getText().toString().trim();
-                    if (query.isEmpty()) { toast("请先输入目的地"); return; }
-                    int days = workdays.isChecked() ? ScheduleLogic.WORKDAYS_MASK : ScheduleLogic.EVERY_DAY_MASK;
-                    resolveFixedAlarmDestination(query, time.getHour(), time.getMinute(), days);
-                }));
+                .setPositiveButton("保存", null));
+        // Attached after show() so an empty place keeps the dialog open instead of discarding the chosen time.
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+            String query = place.getText().toString().trim();
+            if (query.isEmpty()) {
+                place.setError("请先输入目的地");
+                place.requestFocus();
+                return;
+            }
+            dialog.dismiss();
+            int days = workdays.isChecked() ? ScheduleLogic.WORKDAYS_MASK : ScheduleLogic.EVERY_DAY_MASK;
+            resolveFixedAlarmDestination(query, time.getHour(), time.getMinute(), days);
+        });
     }
 
     private void resolveFixedAlarmDestination(final String query, final int hour, final int minute, final int daysMask) {
