@@ -27,10 +27,14 @@ public final class ScheduleManager {
                 System.currentTimeMillis(), TimeZone.getDefault());
         PendingIntent operation = operation(context, alarm.id, PendingIntent.FLAG_UPDATE_CURRENT);
         if (Build.VERSION.SDK_INT < 31 || manager.canScheduleExactAlarms()) {
-            manager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, trigger, operation);
-        } else {
-            manager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, trigger, operation);
+            try {
+                manager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, trigger, operation);
+                return;
+            } catch (SecurityException revoked) {
+                // Exact-alarm access can be revoked between the check and the call; keep an inexact alarm instead.
+            }
         }
+        manager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, trigger, operation);
     }
 
     public static void cancel(Context context, String id) {

@@ -30,6 +30,7 @@ public final class CoreLogicTest {
         testFixedAlarmLaterToday();
         testFixedAlarmSkipsWeekend();
         testEverydayAlarmAdvances();
+        testScheduleFollowsTimeZone();
         testAmapCoordinateConversion();
         testBaiduCoordinateConversion();
         testOverseasCoordinatesUnchanged();
@@ -183,6 +184,18 @@ public final class CoreLogicTest {
         Calendar result = Calendar.getInstance(zone);
         result.setTimeInMillis(next);
         check(result.get(Calendar.DAY_OF_MONTH) == 25 && result.get(Calendar.HOUR_OF_DAY) == 8, "everyday advances");
+    }
+
+    /** A schedule is local wall-clock time, so a time-zone change moves its instant and requires rescheduling. */
+    private static void testScheduleFollowsTimeZone() {
+        TimeZone shanghai = TimeZone.getTimeZone("Asia/Shanghai");
+        TimeZone london = TimeZone.getTimeZone("Europe/London");
+        long now = date(shanghai, 2026, Calendar.AUGUST, 24, 6, 0).getTimeInMillis();
+        long inShanghai = ScheduleLogic.nextTriggerMillis(8, 0, ScheduleLogic.EVERY_DAY_MASK, now, shanghai);
+        long inLondon = ScheduleLogic.nextTriggerMillis(8, 0, ScheduleLogic.EVERY_DAY_MASK, now, london);
+        Calendar local = Calendar.getInstance(london);
+        local.setTimeInMillis(inLondon);
+        check(inShanghai != inLondon && local.get(Calendar.HOUR_OF_DAY) == 8, "schedule follows time zone");
     }
 
     private static void testAmapCoordinateConversion() {
